@@ -1,0 +1,15 @@
+# Local Agent Overrides (Do Not Commit)
+
+## Purpose
+- Use this file for local, developer-specific instructions.
+- Copy this file to `AGENTS.local.md` and edit only your local copy.
+- `AGENTS.local.md` must stay untracked (see `.gitignore`).
+
+## Local Downloader Values (Example)
+- qBittorrent URL: `http://localhost:8080/`
+- Transmission URL: `http://localhost:9091/`
+- Transmission username: `<your-transmission-username>`
+- Transmission password: `<your-transmission-password>`
+
+## Safety
+- Never copy real local values back into `AGENTS.md`, docs, tests, fixtures, or examples.
