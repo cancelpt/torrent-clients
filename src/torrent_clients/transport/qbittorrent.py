@@ -16,6 +16,8 @@ from torrent_clients.transport.http import HttpSession
 
 _API_PREFIX = "/api/v2"
 _START_STOP_WEB_API_THRESHOLD = (2, 11, 0)
+_MODERN_ADD_WEB_API_THRESHOLD = (2, 11, 3)
+_SET_TAGS_WEB_API_THRESHOLD = (2, 11, 4)
 
 
 def _normalize_bool(value: bool) -> str:
@@ -63,6 +65,31 @@ def _build_payload(
     return payload
 
 
+def _normalize_info_params(values: Mapping[str, Any]) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if key == "status_filter":
+            params["filter"] = value
+            continue
+        if key == "torrent_hashes":
+            hashes = _coerce_hashes(value)
+            if hashes:
+                params["hashes"] = hashes
+            continue
+        if key == "fields":
+            continue
+        params[key] = value
+    return params
+
+
+def _coerce_content_layout(root_folder: bool | None) -> str | None:
+    if root_folder is None:
+        return None
+    return "Original" if root_folder else "NoSubfolder"
+
+
 def _parse_version_components(raw_version: str) -> tuple[int, int, int] | None:
     version_parts = [int(part) for part in re.findall(r"\d+", raw_version)]
     if not version_parts:
@@ -88,7 +115,14 @@ class QbittorrentTransport:
         self.password = password or ""
         self.session = session or HttpSession(base_url, timeout=timeout)
         self._logged_in = False
-        self._use_start_stop_endpoints: bool | None = None
+        self._web_api_version_components: tuple[int, int, int] | None = None
+        self._web_api_version_loaded = False
+
+    def _parsed_web_api_version(self) -> tuple[int, int, int] | None:
+        if not self._web_api_version_loaded:
+            self._web_api_version_components = _parse_version_components(self.app_web_api_version())
+            self._web_api_version_loaded = True
+        return self._web_api_version_components
 
     def _request(
         self,
@@ -132,16 +166,11 @@ class QbittorrentTransport:
     def _request_action(self, path: str, *, data: Mapping[str, Any] | None = None, **kwargs):
         response = self._request("POST", path, data=data, **kwargs)
         result = (response.text or "").strip()
-        return {"ok": result in {"Ok.", "ok", "OK"}, "result": result}
+        return {"ok": result in {"", "Ok.", "ok", "OK"}, "result": result}
 
     def _resolve_lifecycle_endpoint(self, modern_path: str, legacy_path: str) -> str:
-        if self._use_start_stop_endpoints is None:
-            raw_version = self.app_web_api_version()
-            parsed = _parse_version_components(raw_version)
-            self._use_start_stop_endpoints = (
-                parsed is not None and parsed >= _START_STOP_WEB_API_THRESHOLD
-            )
-        if self._use_start_stop_endpoints:
+        parsed = self._parsed_web_api_version()
+        if parsed is not None and parsed >= _START_STOP_WEB_API_THRESHOLD:
             return modern_path
         return legacy_path
 
@@ -176,14 +205,35 @@ class QbittorrentTransport:
             raise TransportProtocolError("invalid qBittorrent app preferences payload")
         return payload
 
+    def app_cookies(self):
+        payload = self._request_json("GET", f"{_API_PREFIX}/app/cookies")
+        if not isinstance(payload, list):
+            raise TransportProtocolError("invalid qBittorrent cookies payload")
+        return payload
+
     def app_set_preferences(self, *, prefs: Mapping[str, Any]):
         return self._request_action(
             f"{_API_PREFIX}/app/setPreferences",
             data={"json": json.dumps(dict(prefs))},
         )
 
+    def app_set_cookies(self, *, cookies: Sequence[Mapping[str, Any]] | None = None):
+        return self._request_action(
+            f"{_API_PREFIX}/app/setCookies",
+            data={
+                "cookies": json.dumps(
+                    [dict(cookie) for cookie in cookies or ()],
+                    separators=(",", ":"),
+                )
+            },
+        )
+
     def torrents_info(self, **kwargs):
-        return self._request_json("GET", f"{_API_PREFIX}/torrents/info", params=kwargs)
+        return self._request_json(
+            "GET",
+            f"{_API_PREFIX}/torrents/info",
+            params=_normalize_info_params(kwargs),
+        )
 
     def torrents_add(
         self,
@@ -192,35 +242,45 @@ class QbittorrentTransport:
         torrent_files: Mapping[str, Any] | Sequence[Any] | None = None,
         **kwargs,
     ):
-        data = _build_payload(
-            {
-                "urls": _coerce_urls(urls, separator="\n"),
-                "savepath": kwargs.get("save_path"),
-                "category": kwargs.get("category"),
-                "tags": _coerce_tags(kwargs.get("tags")),
-                "skip_checking": kwargs.get("skip_checking"),
-                "paused": kwargs.get("is_paused"),
-                "root_folder": kwargs.get("root_folder"),
-                "rename": kwargs.get("rename"),
-                "upLimit": kwargs.get("upload_limit"),
-                "dlLimit": kwargs.get("download_limit"),
-                "autoTMM": kwargs.get("use_auto_torrent_management"),
-                "sequentialDownload": kwargs.get("is_sequential_download"),
-                "firstLastPiecePrio": kwargs.get("is_first_last_piece_priority"),
-                "ratioLimit": kwargs.get("ratio_limit"),
-                "seedingTimeLimit": kwargs.get("seeding_time_limit"),
-                "inactiveSeedingTimeLimit": kwargs.get("inactive_seeding_time_limit"),
-                "cookie": kwargs.get("cookie"),
-            },
-            bool_keys=(
-                "skip_checking",
-                "paused",
-                "root_folder",
-                "autoTMM",
-                "sequentialDownload",
-                "firstLastPiecePrio",
-            ),
+        needs_version_shaping = any(
+            kwargs.get(key) is not None for key in ("is_paused", "forced", "root_folder")
         )
+        parsed = self._parsed_web_api_version() if needs_version_shaping else None
+        use_modern_add_payload = parsed is not None and parsed >= _MODERN_ADD_WEB_API_THRESHOLD
+
+        payload_values = {
+            "urls": None if urls is None else _coerce_urls(urls, separator="\n"),
+            "savepath": kwargs.get("save_path"),
+            "category": kwargs.get("category"),
+            "tags": (None if kwargs.get("tags") is None else _coerce_tags(kwargs.get("tags"))),
+            "skip_checking": kwargs.get("skip_checking"),
+            "rename": kwargs.get("rename"),
+            "upLimit": kwargs.get("upload_limit"),
+            "dlLimit": kwargs.get("download_limit"),
+            "autoTMM": kwargs.get("use_auto_torrent_management"),
+            "sequentialDownload": kwargs.get("is_sequential_download"),
+            "firstLastPiecePrio": kwargs.get("is_first_last_piece_priority"),
+            "ratioLimit": kwargs.get("ratio_limit"),
+            "seedingTimeLimit": kwargs.get("seeding_time_limit"),
+            "inactiveSeedingTimeLimit": kwargs.get("inactive_seeding_time_limit"),
+        }
+        bool_keys = [
+            "skip_checking",
+            "autoTMM",
+            "sequentialDownload",
+            "firstLastPiecePrio",
+        ]
+        if use_modern_add_payload:
+            payload_values["stopped"] = kwargs.get("is_paused")
+            payload_values["forced"] = kwargs.get("forced")
+            payload_values["contentLayout"] = _coerce_content_layout(kwargs.get("root_folder"))
+            bool_keys.extend(["stopped", "forced"])
+        else:
+            payload_values["paused"] = kwargs.get("is_paused")
+            payload_values["root_folder"] = kwargs.get("root_folder")
+            bool_keys.extend(["paused", "root_folder"])
+
+        data = _build_payload(payload_values, bool_keys=tuple(bool_keys))
 
         files = self._normalize_torrent_files(torrent_files)
         return self._request_action(f"{_API_PREFIX}/torrents/add", data=data, files=files)
@@ -426,6 +486,18 @@ class QbittorrentTransport:
             data={"hashes": _coerce_hashes(torrent_hashes), "tags": _coerce_tags(tags)},
         )
 
+    def supports_torrents_set_tags(self) -> bool:
+        parsed = self._parsed_web_api_version()
+        return parsed is not None and parsed >= _SET_TAGS_WEB_API_THRESHOLD
+
+    def torrents_set_tags(
+        self, *, torrent_hashes: str | Sequence[str] | None = None, tags: str | Sequence[str]
+    ):
+        return self._request_action(
+            f"{_API_PREFIX}/torrents/setTags",
+            data={"hashes": _coerce_hashes(torrent_hashes), "tags": _coerce_tags(tags)},
+        )
+
     def torrents_remove_tags(
         self,
         *,
@@ -463,6 +535,44 @@ class QbittorrentTransport:
         return self._request_action(
             f"{_API_PREFIX}/torrents/editTracker",
             data={"hash": str(torrent_hash), "origUrl": orig_url, "newUrl": new_url},
+        )
+
+    def torrents_webseeds(self, *, torrent_hash: str):
+        payload = self._request_json(
+            "POST",
+            f"{_API_PREFIX}/torrents/webseeds",
+            data={"hash": str(torrent_hash)},
+        )
+        if not isinstance(payload, list):
+            raise TransportProtocolError("invalid qBittorrent webseeds payload")
+        return payload
+
+    def torrents_add_webseeds(self, *, torrent_hash: str, urls: str | Sequence[str]):
+        return self._request_action(
+            f"{_API_PREFIX}/torrents/addWebSeeds",
+            data={"hash": str(torrent_hash), "urls": _coerce_urls(urls, separator="|")},
+        )
+
+    def torrents_edit_webseed(
+        self,
+        *,
+        torrent_hash: str,
+        original_url: str | None = None,
+        new_url: str,
+        **kwargs,
+    ):
+        orig_url = original_url or kwargs.get("orig_url")
+        if not orig_url:
+            raise ValueError("torrents_edit_webseed requires original_url")
+        return self._request_action(
+            f"{_API_PREFIX}/torrents/editWebSeed",
+            data={"hash": str(torrent_hash), "origUrl": orig_url, "newUrl": new_url},
+        )
+
+    def torrents_remove_webseeds(self, *, torrent_hash: str, urls: str | Sequence[str]):
+        return self._request_action(
+            f"{_API_PREFIX}/torrents/removeWebSeeds",
+            data={"hash": str(torrent_hash), "urls": _coerce_urls(urls, separator="|")},
         )
 
     def torrents_rename(self, *, torrent_hash: str, new_torrent_name: str):

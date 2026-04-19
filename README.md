@@ -16,7 +16,7 @@ pip install -e .
 
 ## Supported Downloader Versions
 
-- qBittorrent: the repository-owned transport currently targets qBittorrent `4.x` through `5.0.1`, including the qB 5 `start/stop` vs legacy `resume/pause` control compatibility.
+- qBittorrent: the repository-owned transport currently targets qBittorrent `4.x` through `5.1.x`, including qB 5 `start/stop` vs legacy `resume/pause` control compatibility, official `/torrents/info` filter/hash translation, and qB `5.1` add/cookie/tag/WebSeed compatibility.
 - Transmission: the repository-owned transport currently targets Transmission `2.40` through `4.0.6`.
 
 ## Quick Start

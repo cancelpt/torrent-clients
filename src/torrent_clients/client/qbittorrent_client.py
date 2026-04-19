@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional
 
@@ -65,6 +65,12 @@ def _mapping_field_value(container: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+def _mapping_copy(container: Any) -> dict[str, Any]:
+    if isinstance(container, Mapping):
+        return dict(container)
+    return dict(getattr(container, "__dict__", {}))
+
+
 def _normalize_snapshot_labels(labels: list[str]) -> list[str]:
     cleaned = [label.strip() for label in labels if label and label.strip()]
     return sorted(set(cleaned))
@@ -82,6 +88,13 @@ def _coerce_domain_status(status: str | None) -> TorrentStatus | None:
         return TorrentStatus(status)
     except ValueError:
         return None
+
+
+def _supports_atomic_tag_replace(client: Any) -> bool:
+    supports = getattr(client, "supports_torrents_set_tags", None)
+    if callable(supports):
+        return bool(supports())
+    return hasattr(client, "torrents_set_tags")
 
 
 class QbTorrentPeerList(TorrentPeerList):
@@ -289,15 +302,22 @@ class QbittorrentClient(BaseClient):
                 )
             )
         )
+        requested_hashes = [str(torrent_id) for torrent_id in torrent_ids]
+        requested_hash_set = set(requested_hashes)
         by_hash = {
             str(require_adapter_field(torrent_data, "hash", context="qBittorrent torrent")): {
-                **dict(torrent_data),
+                **_mapping_copy(torrent_data),
                 "hash": require_adapter_field(torrent_data, "hash", context="qBittorrent torrent"),
                 "name": require_adapter_field(torrent_data, "name", context="qBittorrent torrent"),
             }
             for torrent_data in raw_torrents
+            if str(require_adapter_field(torrent_data, "hash", context="qBittorrent torrent"))
+            in requested_hash_set
         }
-        for torrent_hash, torrent_data in by_hash.items():
+        for torrent_hash in requested_hashes:
+            torrent_data = by_hash.get(torrent_hash)
+            if torrent_data is None:
+                continue
             if include_files and hasattr(client, "torrents_files"):
                 torrent_data["files"] = client.torrents_files(torrent_hash=torrent_hash)
             if include_trackers and hasattr(client, "torrents_trackers"):
@@ -308,7 +328,25 @@ class QbittorrentClient(BaseClient):
                     torrent_data["comment"] = optional_adapter_field(properties, "comment", "")
                 else:
                     torrent_data["comment"] = optional_adapter_field(torrent_data, "comment", "")
-        return list(by_hash.values())
+        return [
+            by_hash[torrent_hash] for torrent_hash in requested_hashes if torrent_hash in by_hash
+        ]
+
+    @staticmethod
+    def _find_matching_torrent(raw_torrents: Sequence[Any], torrent_hash: str) -> Any | None:
+        for torrent_data in raw_torrents:
+            if (
+                str(
+                    require_adapter_field(
+                        torrent_data,
+                        "hash",
+                        context="qBittorrent torrent",
+                    )
+                )
+                == torrent_hash
+            ):
+                return torrent_data
+        return None
 
     def login(self) -> None:
         self._ensure_logged_in()
@@ -456,19 +494,20 @@ class QbittorrentClient(BaseClient):
         is_full_progress_paused = is_stopped(status) and is_completed(torrent.progress)
 
         client.torrents_set_location(torrent_hashes=torrent.id, location=download_dir)
-        torrent_data = client.torrents_info(torrent_hashes=torrent.id)
-        if not torrent_data:
+        torrent_rows = list(client.torrents_info(torrent_hashes=torrent.id))
+        torrent_data = self._find_matching_torrent(torrent_rows, str(torrent.id))
+        if torrent_data is None:
             return False
 
-        current_save_path = optional_adapter_field(torrent_data[0], "save_path", "")
+        current_save_path = optional_adapter_field(torrent_data, "save_path", "")
         moved_successfully = current_save_path == download_dir.rstrip("/").rstrip("\\")
 
         if is_full_progress_paused:
             current_status = convert_status(
-                optional_adapter_field(torrent_data[0], "state", "unknown"),
+                optional_adapter_field(torrent_data, "state", "unknown"),
                 DownloaderKind.QBITTORRENT,
             )
-            current_progress = optional_adapter_field(torrent_data[0], "progress", 0)
+            current_progress = optional_adapter_field(torrent_data, "progress", 0)
             if is_stopped(current_status) and not is_completed(current_progress):
                 client.torrents_stop(torrent_hashes=torrent.id)
 
@@ -483,19 +522,22 @@ class QbittorrentClient(BaseClient):
     def get_torrent_info(self, torrent_id: int | str) -> Optional[TorrentInfo]:
         torrent_hash = str(torrent_id)
         client = self._ensure_logged_in()
-        torrent_data = client.torrents_info(
-            **self._build_query_kwargs(
-                query=TorrentQuery(torrent_ids=[torrent_hash]),
-                fields=_SUMMARY_FIELDS,
+        torrent_rows = list(
+            client.torrents_info(
+                **self._build_query_kwargs(
+                    query=TorrentQuery(torrent_ids=[torrent_hash]),
+                    fields=_SUMMARY_FIELDS,
+                )
             )
         )
-        if not torrent_data:
+        torrent_data = self._find_matching_torrent(torrent_rows, torrent_hash)
+        if torrent_data is None:
             return None
 
         payload = {
-            **dict(torrent_data[0]),
-            "hash": require_adapter_field(torrent_data[0], "hash", context="qBittorrent torrent"),
-            "name": require_adapter_field(torrent_data[0], "name", context="qBittorrent torrent"),
+            **_mapping_copy(torrent_data),
+            "hash": require_adapter_field(torrent_data, "hash", context="qBittorrent torrent"),
+            "name": require_adapter_field(torrent_data, "name", context="qBittorrent torrent"),
         }
         if hasattr(client, "torrents_files"):
             payload["files"] = client.torrents_files(torrent_hash=torrent_hash)
@@ -509,17 +551,39 @@ class QbittorrentClient(BaseClient):
 
     def set_labels(self, torrent: TorrentInfo, labels: list[str]) -> None:
         client = self._ensure_logged_in()
-        old_labels = torrent.labels or []
-        deleted_labels = [label for label in old_labels if label not in labels]
+        old_labels = _normalize_target_labels(list(torrent.labels or []))
+        target_labels = _normalize_target_labels(labels)
+        if old_labels == target_labels:
+            return
+        if _supports_atomic_tag_replace(client):
+            client.torrents_set_tags(torrent_hashes=str(torrent.id), tags=target_labels)
+            return
+        deleted_labels = [label for label in old_labels if label not in target_labels]
         if deleted_labels:
             client.torrents_remove_tags(torrent_hashes=torrent.id, tags=deleted_labels)
 
-        new_labels = [label for label in labels if label not in old_labels]
+        new_labels = [label for label in target_labels if label not in old_labels]
         if new_labels:
             client.torrents_add_tags(torrent_hashes=torrent.id, tags=new_labels)
 
     def set_labels_many(self, updates: Sequence[tuple[TorrentInfo, list[str]]]) -> None:
         client = self._ensure_logged_in()
+        if _supports_atomic_tag_replace(client):
+            set_buckets: dict[tuple[str, ...], list[str]] = {}
+            for torrent, labels in updates:
+                current_labels = tuple(_normalize_target_labels(list(torrent.labels or [])))
+                target_labels = tuple(_normalize_target_labels(labels))
+                if current_labels == target_labels:
+                    continue
+                set_buckets.setdefault(target_labels, []).append(str(torrent.id))
+
+            for target_labels, torrent_hashes in set_buckets.items():
+                client.torrents_set_tags(
+                    torrent_hashes=torrent_hashes,
+                    tags=list(target_labels),
+                )
+            return
+
         add_buckets: dict[tuple[str, ...], list[str]] = {}
         remove_buckets: dict[tuple[str, ...], list[str]] = {}
 

@@ -14,7 +14,7 @@ pip install -e .
 
 ## 支持的下载器版本
 
-- qBittorrent：仓库自有 transport 当前文档化支持 qBittorrent `4.x` 到 `5.0.1`，并兼容 qB 5 的 `start/stop` 与旧版 `resume/pause` 控制命名差异。
+- qBittorrent：仓库自有 transport 当前文档化支持 qBittorrent `4.x` 到 `5.1.x`，并兼容 qB 5 的 `start/stop` 与旧版 `resume/pause` 控制命名差异、官方 `/torrents/info` 的 filter/hash 参数，以及 qB `5.1` 的添加、cookie、标签原子替换与 WebSeed 能力。
 - Transmission：仓库自有 transport 当前文档化支持 Transmission `2.40` 到 `4.0.6`。
 
 ## 快速开始

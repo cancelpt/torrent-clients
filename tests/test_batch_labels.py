@@ -18,6 +18,14 @@ class _QbRPCStub:
         self.remove_calls.append((torrent_hashes, tags))
 
 
+class _QbAtomicRPCStub:
+    def __init__(self) -> None:
+        self.set_calls = []
+
+    def torrents_set_tags(self, torrent_hashes=None, tags=None):  # type: ignore[no-untyped-def]
+        self.set_calls.append((torrent_hashes, tags))
+
+
 class _TransmissionRPCStub:
     def __init__(self) -> None:
         self.change_calls = []
@@ -76,3 +84,36 @@ def test_qb_set_labels_many_groups_add_and_remove_deltas() -> None:
 
     assert stub.add_calls == [(["hash-a", "hash-b"], ["B"])]
     assert stub.remove_calls == [(["hash-c"], ["X"])]
+
+
+def test_qb_set_labels_uses_atomic_set_tags_when_available() -> None:
+    client = QbittorrentClient("http://localhost:8080/", "", "", name="qb")
+    stub = _QbAtomicRPCStub()
+    client.client = stub
+    torrent = SimpleNamespace(id="hash-a", hash_string="hash-a", labels=["old-a"])
+
+    client.set_labels(torrent, ["B", "A", "A"])
+
+    assert stub.set_calls == [("hash-a", ["A", "B"])]
+
+
+def test_qb_set_labels_many_groups_by_final_labels_when_atomic_set_tags_is_available() -> None:
+    client = QbittorrentClient("http://localhost:8080/", "", "", name="qb")
+    stub = _QbAtomicRPCStub()
+    client.client = stub
+    torrent_a = SimpleNamespace(id="hash-a", hash_string="hash-a", labels=["old-a"])
+    torrent_b = SimpleNamespace(id="hash-b", hash_string="hash-b", labels=["old-b"])
+    torrent_c = SimpleNamespace(id="hash-c", hash_string="hash-c", labels=["old-c"])
+
+    client.set_labels_many(
+        [
+            (torrent_a, ["A", "B"]),
+            (torrent_b, ["B", "A"]),
+            (torrent_c, []),
+        ]
+    )
+
+    assert stub.set_calls == [
+        (["hash-a", "hash-b"], ["A", "B"]),
+        (["hash-c"], []),
+    ]

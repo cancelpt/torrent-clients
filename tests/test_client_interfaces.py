@@ -399,6 +399,18 @@ class _QbMoveReStopRPCStub(_QbMoveRPCStub):
         return [torrent]
 
 
+class _QbMoveMixedResponseRPCStub(_QbMoveRPCStub):
+    def torrents_info(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.last_info_kwargs = kwargs
+        unrelated = _FakeQbTorrent(torrent_hash="other-hash", name="other")
+        unrelated["save_path"] = "/wrong/path"
+        matched = _FakeQbTorrent(torrent_hash="abc123", name="demo")
+        matched["save_path"] = self.moved_to
+        matched["progress"] = 1.0
+        matched["state"] = "pausedUP"
+        return [unrelated, matched]
+
+
 def _new_qb_client() -> QbittorrentClient:
     return QbittorrentClient(
         os.getenv("TEST_QB_URL", "http://localhost:8080/"),
@@ -512,6 +524,21 @@ def test_qb_get_torrent_info_returns_single_result() -> None:
     assert info.id == "abc123"
 
 
+def test_qb_get_torrent_info_ignores_unrelated_overselected_results() -> None:
+    client = _new_qb_client()
+    stub = _QbRPCStub()
+    stub.response = [
+        _FakeQbTorrent(torrent_hash="other-hash", name="other"),
+        _FakeQbTorrent(torrent_hash="abc123", name="demo"),
+    ]
+    client.client = stub
+
+    info = client.get_torrent_info("abc123")
+
+    assert info is not None
+    assert info.id == "abc123"
+
+
 def test_qb_supports_ip_ban_capability() -> None:
     client = _new_qb_client()
 
@@ -560,6 +587,11 @@ def test_transmission_remove_torrent_supports_batch_and_delete_data_flag() -> No
 def test_qb_hydrate_files_uses_torrent_id_query() -> None:
     client = _new_qb_client()
     stub = _QbRPCStub()
+    stub.response = [
+        _FakeQbTorrent(torrent_hash="hash-a", name="A"),
+        _FakeQbTorrent(torrent_hash="hash-b", name="B"),
+        _FakeQbTorrent(torrent_hash="hash-c", name="C"),
+    ]
     stub.files_by_hash = {
         "hash-a": [{"name": "a.bin", "size": 10, "progress": 1.0, "priority": 1}],
         "hash-b": [{"name": "b.bin", "size": 20, "progress": 1.0, "priority": 0}],
@@ -568,9 +600,10 @@ def test_qb_hydrate_files_uses_torrent_id_query() -> None:
 
     result = client.hydrate_files(["hash-a", "hash-b"])
 
-    assert len(result) == 1
+    assert len(result) == 2
+    assert [torrent.id for torrent in result] == ["hash-a", "hash-b"]
     assert stub.last_info_kwargs["torrent_hashes"] == ["hash-a", "hash-b"]
-    assert stub.files_calls == ["abc123"]
+    assert stub.files_calls == ["hash-a", "hash-b"]
 
 
 def test_transmission_hydrate_files_requests_file_arguments() -> None:
@@ -764,6 +797,23 @@ def test_qb_move_torrent_reapplies_stop_helper_when_completed_stopped_torrent_be
     assert moved is True
     assert stub.stop_calls == ["abc123"]
     assert stub.pause_calls == []
+
+
+def test_qb_move_torrent_uses_matching_torrent_when_query_returns_unrelated_rows() -> None:
+    client = _new_qb_client()
+    stub = _QbMoveMixedResponseRPCStub(moved_to="/new/path")
+    client.client = stub
+    torrent = TorrentInfo(
+        id="abc123",
+        name="demo",
+        hash_string="abc123",
+        progress=1.0,
+        status=TorrentStatus.STOPPED,
+    )
+
+    moved = client.move_torrent(torrent, "/new/path", move_files=True)
+
+    assert moved is True
 
 
 def test_qb_reannounce_torrent_supports_batch_ids() -> None:
