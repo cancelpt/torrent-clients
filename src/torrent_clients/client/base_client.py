@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
+from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Protocol, Sequence, TypeVar, Union, cast, runtime_checkable
+from typing import (
+    Any,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    TypeVar,
+    Union,
+    cast,
+    runtime_checkable,
+)
 
 from torrent_clients.torrent.torrent_info import TorrentInfo, TorrentList
 from torrent_clients.torrent.torrent_peer import TorrentPeerList
@@ -25,7 +36,7 @@ class MissingAdapterFieldError(RuntimeError):
 def adapter_field_value(container: Any, key: str, default: Any = _MISSING_FIELD) -> Any:
     """Fetch a raw downloader field from mapping-like or attribute-style payloads."""
     value = _MISSING_FIELD
-    if isinstance(container, Mapping):
+    if isinstance(container, ABCMapping):
         value = container.get(key, _MISSING_FIELD)
     else:
         getter = getattr(container, "get", None)
@@ -122,7 +133,7 @@ class ClientStats(Mapping[str, Any]):
                 and self.download_limited == other.download_limited
                 and self.upload_limited == other.upload_limited
             )
-        if isinstance(other, Mapping):
+        if isinstance(other, ABCMapping):
             return self.to_dict() == dict(other.items())
         return NotImplemented
 
