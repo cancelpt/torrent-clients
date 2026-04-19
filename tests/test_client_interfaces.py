@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from torrent_clients.client.base_client import (
+    ClientStats,
     QueueDirection,
     SupportsIpBan,
     SupportsLazyTorrentFetch,
@@ -14,7 +15,11 @@ from torrent_clients.client.base_client import (
     UnsupportedClientCapabilityError,
 )
 from torrent_clients.client.qbittorrent_client import QbittorrentClient
-from torrent_clients.client.transmission_client import TransmissionClient
+from torrent_clients.client.transmission_client import (
+    TransmissionClient,
+    TrTorrentList,
+    TrTorrentTrackerList,
+)
 from torrent_clients.torrent.torrent_info import TorrentInfo
 from torrent_clients.torrent.torrent_status import TorrentStatus
 
@@ -224,6 +229,8 @@ class _QbRPCStub:
         self.recheck_calls = []
         self.pause_calls = []
         self.resume_calls = []
+        self.start_calls = []
+        self.stop_calls = []
         self.last_info_kwargs = None
         self.reannounce_calls = []
         self.set_upload_limit_calls = []
@@ -256,6 +263,12 @@ class _QbRPCStub:
 
     def torrents_resume(self, torrent_hashes=None):  # type: ignore[no-untyped-def]
         self.resume_calls.append(torrent_hashes)
+
+    def torrents_start(self, torrent_hashes=None):  # type: ignore[no-untyped-def]
+        self.start_calls.append(torrent_hashes)
+
+    def torrents_stop(self, torrent_hashes=None):  # type: ignore[no-untyped-def]
+        self.stop_calls.append(torrent_hashes)
 
     def torrents_reannounce(self, torrent_hashes=None):  # type: ignore[no-untyped-def]
         self.reannounce_calls.append(torrent_hashes)
@@ -347,6 +360,16 @@ class _QbMoveRPCStub(_QbRPCStub):
         torrent["save_path"] = self.moved_to
         torrent["progress"] = 1.0
         torrent["state"] = "pausedUP"
+        return [torrent]
+
+
+class _QbMoveReStopRPCStub(_QbMoveRPCStub):
+    def torrents_info(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.last_info_kwargs = kwargs
+        torrent = _FakeQbTorrent()
+        torrent["save_path"] = self.moved_to
+        torrent["progress"] = 0.5
+        torrent["state"] = "stoppedDL"
         return [torrent]
 
 
@@ -516,8 +539,10 @@ def test_qb_lifecycle_methods_support_batch_ids() -> None:
     client.resume_torrent(["hash-a", "hash-b"])
     client.recheck_torrent(["hash-a", "hash-b"])
 
-    assert stub.pause_calls == [["hash-a", "hash-b"]]
-    assert stub.resume_calls == [["hash-a", "hash-b"]]
+    assert stub.stop_calls == [["hash-a", "hash-b"]]
+    assert stub.start_calls == [["hash-a", "hash-b"]]
+    assert stub.pause_calls == []
+    assert stub.resume_calls == []
     assert stub.recheck_calls == [["hash-a", "hash-b"]]
 
 
@@ -592,6 +617,27 @@ def test_qb_move_torrent_returns_true_when_location_matches() -> None:
     moved = client.move_torrent(torrent, "/new/path", move_files=True)
 
     assert moved is True
+
+
+def test_qb_move_torrent_reapplies_stop_helper_when_completed_stopped_torrent_becomes_incomplete() -> (
+    None
+):
+    client = _new_qb_client()
+    stub = _QbMoveReStopRPCStub(moved_to="/new/path")
+    client.client = stub
+    torrent = TorrentInfo(
+        id="abc123",
+        name="demo",
+        hash_string="abc123",
+        progress=1.0,
+        status=TorrentStatus.STOPPED,
+    )
+
+    moved = client.move_torrent(torrent, "/new/path", move_files=True)
+
+    assert moved is True
+    assert stub.stop_calls == ["abc123"]
+    assert stub.pause_calls == []
 
 
 def test_qb_reannounce_torrent_supports_batch_ids() -> None:
@@ -805,12 +851,62 @@ def test_qb_get_client_stats_uses_transfer_info() -> None:
 
     stats = client.get_client_stats()
 
-    assert stats == {
+    expected = {
         "download_speed": 111,
         "upload_speed": 222,
         "download_limit": 1000,
         "upload_limit": 2000,
     }
+
+    assert isinstance(stats, ClientStats)
+    assert stats.download_speed == 111
+    assert stats["upload_speed"] == 222
+    assert dict(stats.items()) == expected
+    assert stats == expected
+
+
+def test_qb_get_client_stats_logs_missing_expected_fields(caplog: pytest.LogCaptureFixture) -> None:
+    client = _new_qb_client()
+
+    class _MissingFieldQbRPCStub(_QbRPCStub):
+        def transfer_info(self):  # type: ignore[no-untyped-def]
+            return {
+                "up_info_speed": 222,
+                "dl_rate_limit": 1000,
+                "up_rate_limit": 2000,
+            }
+
+    client.client = _MissingFieldQbRPCStub()
+
+    with caplog.at_level("WARNING", logger="torrent_clients.client.qbittorrent_client"):
+        stats = client.get_client_stats()
+
+    assert stats.download_speed == 0
+    assert "dl_info_speed" in caplog.text
+
+
+def test_qb_get_client_stats_does_not_log_for_legitimate_zero_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _new_qb_client()
+
+    class _ZeroValueQbRPCStub(_QbRPCStub):
+        def transfer_info(self):  # type: ignore[no-untyped-def]
+            return {
+                "dl_info_speed": 0,
+                "up_info_speed": 0,
+                "dl_rate_limit": 0,
+                "up_rate_limit": 0,
+            }
+
+    client.client = _ZeroValueQbRPCStub()
+
+    with caplog.at_level("WARNING", logger="torrent_clients.client.qbittorrent_client"):
+        stats = client.get_client_stats()
+
+    assert stats.download_speed == 0
+    assert stats.upload_speed == 0
+    assert "missing expected field" not in caplog.text
 
 
 def test_transmission_get_client_stats_merges_session_and_stats() -> None:
@@ -820,7 +916,7 @@ def test_transmission_get_client_stats_merges_session_and_stats() -> None:
 
     stats = client.get_client_stats()
 
-    assert stats == {
+    expected = {
         "download_speed": 123,
         "upload_speed": 456,
         "download_limit": 1000,
@@ -828,3 +924,81 @@ def test_transmission_get_client_stats_merges_session_and_stats() -> None:
         "download_limited": True,
         "upload_limited": False,
     }
+
+    assert isinstance(stats, ClientStats)
+    assert stats.download_limit == 1000
+    assert stats.get("upload_limited") is False
+    assert dict(stats.items()) == expected
+    assert stats == expected
+
+
+def test_transmission_get_client_stats_logs_missing_expected_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _new_tr_client()
+
+    class _MissingFieldTransmissionRPCStub(_TransmissionRPCStub):
+        def session_stats(self):  # type: ignore[no-untyped-def]
+            return {"uploadSpeed": 456}
+
+    client.client = _MissingFieldTransmissionRPCStub()
+
+    with caplog.at_level("WARNING", logger="torrent_clients.client.transmission_client"):
+        stats = client.get_client_stats()
+
+    assert stats.download_speed == 0
+    assert "downloadSpeed" in caplog.text
+
+
+def test_transmission_torrent_transform_raises_for_missing_required_name() -> None:
+    broken_torrent = _FakeTorrent(
+        data={
+            "id": 101,
+            "hashString": "hash-101",
+            "downloadDir": "/downloads",
+        },
+        fields={"id", "hashString", "downloadDir"},
+    )
+
+    with pytest.raises(RuntimeError, match="missing required field.*name"):
+        _ = TrTorrentList(raw=[broken_torrent])[0]
+
+
+def test_transmission_tracker_transform_keeps_missing_counts_as_sentinels() -> None:
+    trackers = TrTorrentTrackerList(
+        raw=[
+            {
+                "announce": "http://tracker.local/announce",
+            }
+        ]
+    )
+
+    tracker = trackers[0]
+
+    assert tracker is not None
+    assert tracker.downloaded == -1
+    assert tracker.seeder == -1
+    assert tracker.leecher == -1
+    assert tracker.peers == -1
+
+
+def test_client_stats_supports_attribute_and_mapping_access() -> None:
+    stats = ClientStats(
+        download_speed=1,
+        upload_speed=2,
+        download_limit=3,
+        upload_limit=4,
+    )
+
+    assert stats.download_speed == 1
+    assert stats["upload_speed"] == 2
+    assert stats.get("missing", "fallback") == "fallback"
+    assert "download_limited" not in stats
+    expected = {
+        "download_speed": 1,
+        "upload_speed": 2,
+        "download_limit": 3,
+        "upload_limit": 4,
+    }
+    assert dict(stats.items()) == expected
+    assert stats == expected

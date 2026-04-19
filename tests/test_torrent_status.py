@@ -34,6 +34,8 @@ def test_transmission_status_mapping(raw_status: int, expected: TorrentStatus) -
     [
         ("pausedUP", TorrentStatus.STOPPED),
         ("pausedDL", TorrentStatus.STOPPED),
+        ("stoppedUP", TorrentStatus.STOPPED),
+        ("stoppedDL", TorrentStatus.STOPPED),
         ("uploading", TorrentStatus.SEEDING),
         ("queuedDL", TorrentStatus.QUEUED),
         ("checkingResumeData", TorrentStatus.CHECKING),

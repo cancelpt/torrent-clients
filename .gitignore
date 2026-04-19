@@ -24,3 +24,6 @@ htmlcov/
 .vscode/
 
 AGENTS.local.md
+.claude
+.codex
+openspec/

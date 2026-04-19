@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Union
 
-from torrent_clients.client.client_type import ClientType
 from torrent_clients.client.base_client import TorrentSnapshot
+from torrent_clients.client.client_type import ClientType
 from torrent_clients.client.qbittorrent_client import QbittorrentClient
 from torrent_clients.client.transmission_client import TransmissionClient
 

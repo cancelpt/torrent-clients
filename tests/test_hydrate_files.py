@@ -50,6 +50,54 @@ class _FakeTransmissionTorrent:
         return self._data.get(key, default)
 
 
+class _QbRPCStub:
+    def __init__(self, response=None) -> None:
+        self.last_info_kwargs = None
+        self.response = response or []
+
+    def auth_log_in(self) -> bool:
+        return True
+
+    def torrents_info(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.last_info_kwargs = kwargs
+        return self.response
+
+
+class _FakeQbTorrent(dict):
+    def __init__(self, files: list[dict] | None = None) -> None:
+        super().__init__(
+            save_path="/downloads",
+            total_size=123,
+            progress=1.0,
+            dlspeed=0,
+            upspeed=0,
+            completed=123,
+            size=123,
+            category="",
+            uploaded=0,
+            num_leechs=0,
+            num_seeds=0,
+            added_on=100,
+            tags="done",
+            state="pausedUP",
+        )
+        self.hash = "hash-a"
+        self.name = "Movie"
+        self._files = files or []
+
+    @property
+    def files(self):  # type: ignore[no-untyped-def]
+        return self._files
+
+    @property
+    def trackers(self):  # type: ignore[no-untyped-def]
+        return []
+
+    @property
+    def properties(self):  # type: ignore[no-untyped-def]
+        return {"comment": ""}
+
+
 def test_qb_hydrate_files_uses_torrent_id_query() -> None:
     client = _new_qb_client()
     captured_queries = []
@@ -65,6 +113,30 @@ def test_qb_hydrate_files_uses_torrent_id_query() -> None:
     assert result == ["hydrated"]
     assert captured_queries[0][0] is None
     assert captured_queries[0][1].torrent_ids == ["hash-a", "hash-b"]
+
+
+def test_qb_hydrate_files_returns_file_selection_metadata() -> None:
+    client = _new_qb_client()
+    stub = _QbRPCStub(
+        response=[
+            _FakeQbTorrent(
+                files=[
+                    {"name": "movie.mkv", "size": 123, "progress": 1.0, "priority": 0},
+                    {"name": "sample.mkv", "size": 23, "progress": 1.0, "priority": 6},
+                ]
+            )
+        ]
+    )
+    client.client = stub
+
+    result = client.hydrate_files(["hash-a"])
+    torrent = result[0]
+
+    assert stub.last_info_kwargs == {"status_filter": None, "torrent_hashes": ["hash-a"]}
+    assert [(file.name, file.priority, file.wanted) for file in torrent.files] == [
+        ("movie.mkv", 0, False),
+        ("sample.mkv", 6, True),
+    ]
 
 
 def test_transmission_hydrate_files_requests_file_arguments() -> None:
@@ -193,6 +265,4 @@ def test_transmission_hydrate_trackers_requests_tracker_fields() -> None:
             "arguments": ("id", "hashString", "name", "downloadDir", "trackerStats"),
         }
     ]
-    assert [tracker.url for tracker in torrent.trackers] == [
-        "https://tracker.example/announce"
-    ]
+    assert [tracker.url for tracker in torrent.trackers] == ["https://tracker.example/announce"]

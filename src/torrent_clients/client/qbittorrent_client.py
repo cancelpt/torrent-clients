@@ -17,6 +17,9 @@ from torrent_clients.client.base_client import (
     TorrentIdInput,
     TorrentQuery,
     TorrentSnapshot,
+    best_effort_adapter_field,
+    optional_adapter_field,
+    require_adapter_field,
 )
 from torrent_clients.torrent.torrent_file import TorrentFile, TorrentFileList
 from torrent_clients.torrent.torrent_info import LazyProxy, TorrentInfo, TorrentList
@@ -78,9 +81,14 @@ class QbTorrentFileList(TorrentFileList):
 
     def transform(self, file_data: list[Any]) -> TorrentFile:
         file_item = file_data[0]
+        raw_priority = file_item.get("priority")
+        priority = int(raw_priority) if raw_priority is not None else 0
+        wanted = True if raw_priority is None else priority != 0
         return TorrentFile(
             name=file_item.get("name", ""),
             size=file_item.get("size"),
+            priority=priority,
+            wanted=wanted,
             progress=file_item.get("progress"),
         )
 
@@ -100,15 +108,15 @@ class QbTorrentTrackerList(TorrentTrackerList):
     """qBittorrent tracker list adapter."""
 
     def transform(self, tracker_data: dict[str, Any]) -> Optional[TorrentTracker]:
-        tracker_url = tracker_data.get("url", "")
+        tracker_url = optional_adapter_field(tracker_data, "url", "")
         if re.match(r"^(udp|http|https)://", tracker_url):
             return TorrentTracker(
                 url=tracker_url,
-                downloaded=tracker_data.get("num_downloaded", -1),
-                seeder=tracker_data.get("num_seeds", -1),
-                leecher=tracker_data.get("num_leeches", -1),
-                peers=tracker_data.get("num_peers", -1),
-                info=tracker_data.get("msg", ""),
+                downloaded=optional_adapter_field(tracker_data, "num_downloaded", -1),
+                seeder=optional_adapter_field(tracker_data, "num_seeds", -1),
+                leecher=optional_adapter_field(tracker_data, "num_leeches", -1),
+                peers=optional_adapter_field(tracker_data, "num_peers", -1),
+                info=optional_adapter_field(tracker_data, "msg", ""),
             )
         return None
 
@@ -117,35 +125,42 @@ class QbTorrentList(TorrentList):
     """qBittorrent torrent list adapter."""
 
     def transform(self, torrent_data: TorrentDictionary) -> TorrentInfo:
-        torrent_hash = torrent_data.hash
-        tags = torrent_data.get("tags", "")
+        # Required identifiers must be present; other fields keep stable defaults/sentinels.
+        torrent_hash = require_adapter_field(torrent_data, "hash", context="qBittorrent torrent")
+        torrent_name = require_adapter_field(torrent_data, "name", context="qBittorrent torrent")
+        tags = optional_adapter_field(torrent_data, "tags", "")
         labels = [label.strip() for label in tags.split(",")] if tags else []
-        status = convert_status(torrent_data.get("state", "unknown"), DownloaderKind.QBITTORRENT)
+        status = convert_status(
+            optional_adapter_field(torrent_data, "state", "unknown"),
+            DownloaderKind.QBITTORRENT,
+        )
 
         files = LazyProxy(lambda: QbTorrentFileList(torrent_hash, raw=[torrent_data.files]))
         trackers = LazyProxy(lambda: QbTorrentTrackerList(raw=torrent_data.trackers))
 
         return TorrentInfo(
             id=torrent_hash,
-            name=torrent_data.name,
+            name=torrent_name,
             hash_string=torrent_hash,
-            download_dir=torrent_data.get("save_path"),
-            size=torrent_data.get("total_size", 0),
-            progress=torrent_data.get("progress", 0),
+            download_dir=optional_adapter_field(torrent_data, "save_path", None),
+            size=optional_adapter_field(torrent_data, "total_size", 0),
+            progress=optional_adapter_field(torrent_data, "progress", 0),
             status=status,
-            download_speed=torrent_data.get("dlspeed", 0),
-            upload_speed=torrent_data.get("upspeed", 0),
+            download_speed=optional_adapter_field(torrent_data, "dlspeed", 0),
+            upload_speed=optional_adapter_field(torrent_data, "upspeed", 0),
             labels=labels,
             files=files,
             trackers=trackers,
-            completed_size=torrent_data.get("completed", 0),
-            selected_size=torrent_data.get("size", 0),
-            category=torrent_data.get("category", ""),
-            uploaded_size=torrent_data.get("uploaded", 0),
-            num_leechs=torrent_data.get("num_leechs", -1),
-            num_seeds=torrent_data.get("num_seeds", -1),
-            added_on=torrent_data.get("added_on", -1),
-            comment=LazyProxy(lambda: torrent_data.properties.get("comment", "")),
+            completed_size=optional_adapter_field(torrent_data, "completed", 0),
+            selected_size=optional_adapter_field(torrent_data, "size", 0),
+            category=optional_adapter_field(torrent_data, "category", ""),
+            uploaded_size=optional_adapter_field(torrent_data, "uploaded", 0),
+            num_leechs=optional_adapter_field(torrent_data, "num_leechs", -1),
+            num_seeds=optional_adapter_field(torrent_data, "num_seeds", -1),
+            added_on=optional_adapter_field(torrent_data, "added_on", -1),
+            comment=LazyProxy(
+                lambda: optional_adapter_field(torrent_data.properties, "comment", "")
+            ),
         )
 
 
@@ -203,10 +218,14 @@ class QbittorrentClient(BaseClient):
         return result == "Ok."
 
     def remove_torrent(self, torrent_id: TorrentIdInput, delete_data: bool = False) -> None:
-        torrent_hashes = [str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)]
+        torrent_hashes = [
+            str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)
+        ]
         self.client.torrents_delete(torrent_hashes=torrent_hashes, delete_files=delete_data)
 
-    def get_torrents(self, status: str | None = None, query: TorrentQuery | None = None) -> TorrentList:
+    def get_torrents(
+        self, status: str | None = None, query: TorrentQuery | None = None
+    ) -> TorrentList:
         if self.client is None or not self.client.auth_log_in():
             self.login()
             logger.info("Successfully connected to qbittorrent: %s", self.url)
@@ -258,26 +277,35 @@ class QbittorrentClient(BaseClient):
 
         snapshots: list[TorrentSnapshot] = []
         for torrent_data in self.client.torrents_info(**query_kwargs):
-            torrent_hash = torrent_data.hash
-            tags = torrent_data.get("tags", "")
+            torrent_hash = require_adapter_field(
+                torrent_data,
+                "hash",
+                context="qBittorrent snapshot",
+            )
+            torrent_name = require_adapter_field(
+                torrent_data,
+                "name",
+                context="qBittorrent snapshot",
+            )
+            tags = optional_adapter_field(torrent_data, "tags", "")
             labels = _normalize_snapshot_labels(tags.split(",")) if tags else []
             status = convert_status(
-                torrent_data.get("state", "unknown"),
+                optional_adapter_field(torrent_data, "state", "unknown"),
                 DownloaderKind.QBITTORRENT,
             )
             snapshots.append(
                 TorrentSnapshot(
                     id=torrent_hash,
                     hash_string=torrent_hash,
-                    name=torrent_data.name,
-                    download_dir=torrent_data.get("save_path", ""),
-                    progress=torrent_data.get("progress", 0),
-                    size=torrent_data.get("total_size", 0),
-                    selected_size=torrent_data.get("size", 0),
-                    completed_size=torrent_data.get("completed", 0),
+                    name=torrent_name,
+                    download_dir=optional_adapter_field(torrent_data, "save_path", ""),
+                    progress=optional_adapter_field(torrent_data, "progress", 0),
+                    size=optional_adapter_field(torrent_data, "total_size", 0),
+                    selected_size=optional_adapter_field(torrent_data, "size", 0),
+                    completed_size=optional_adapter_field(torrent_data, "completed", 0),
                     labels=labels,
                     status=status.value,
-                    added_on=torrent_data.get("added_on", None),
+                    added_on=optional_adapter_field(torrent_data, "added_on", None),
                 )
             )
 
@@ -315,12 +343,14 @@ class QbittorrentClient(BaseClient):
             current_status = convert_status(torrent_data[0].state, DownloaderKind.QBITTORRENT)
             current_progress = torrent_data[0].get("progress", 0)
             if is_stopped(current_status) and not is_completed(current_progress):
-                self.client.torrents_pause(torrent_hashes=torrent.id)
+                self.client.torrents_stop(torrent_hashes=torrent.id)
 
         return moved_successfully
 
     def recheck_torrent(self, torrent_id: TorrentIdInput) -> None:
-        torrent_hashes = [str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)]
+        torrent_hashes = [
+            str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)
+        ]
         self.client.torrents_recheck(torrent_hashes=torrent_hashes)
 
     def get_torrent_info(self, torrent_id: int | str) -> Optional[TorrentInfo]:
@@ -349,9 +379,7 @@ class QbittorrentClient(BaseClient):
             labels_to_remove = tuple(
                 label for label in current_labels if label not in target_labels
             )
-            labels_to_add = tuple(
-                label for label in target_labels if label not in current_labels
-            )
+            labels_to_add = tuple(label for label in target_labels if label not in current_labels)
 
             if labels_to_remove:
                 remove_buckets.setdefault(labels_to_remove, []).append(str(torrent.id))
@@ -372,14 +400,18 @@ class QbittorrentClient(BaseClient):
     def hydrate_files(self, torrent_ids: TorrentIdInput) -> TorrentList:
         return self.get_torrents(
             query=TorrentQuery(
-                torrent_ids=[str(torrent_id) for torrent_id in self._normalize_torrent_ids(torrent_ids)]
+                torrent_ids=[
+                    str(torrent_id) for torrent_id in self._normalize_torrent_ids(torrent_ids)
+                ]
             )
         )
 
     def hydrate_trackers(self, torrent_ids: TorrentIdInput) -> TorrentList:
         return self.get_torrents(
             query=TorrentQuery(
-                torrent_ids=[str(torrent_id) for torrent_id in self._normalize_torrent_ids(torrent_ids)]
+                torrent_ids=[
+                    str(torrent_id) for torrent_id in self._normalize_torrent_ids(torrent_ids)
+                ]
             )
         )
 
@@ -391,15 +423,21 @@ class QbittorrentClient(BaseClient):
         self.client.torrents_set_category(torrent_hashes=torrent_hash, category=category)
 
     def resume_torrent(self, torrent_id: TorrentIdInput) -> None:
-        torrent_hashes = [str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)]
-        self.client.torrents_resume(torrent_hashes=torrent_hashes)
+        torrent_hashes = [
+            str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)
+        ]
+        self.client.torrents_start(torrent_hashes=torrent_hashes)
 
     def pause_torrent(self, torrent_id: TorrentIdInput) -> None:
-        torrent_hashes = [str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)]
-        self.client.torrents_pause(torrent_hashes=torrent_hashes)
+        torrent_hashes = [
+            str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)
+        ]
+        self.client.torrents_stop(torrent_hashes=torrent_hashes)
 
     def reannounce_torrent(self, torrent_id: TorrentIdInput) -> None:
-        torrent_hashes = [str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)]
+        torrent_hashes = [
+            str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)
+        ]
         self.client.torrents_reannounce(torrent_hashes=torrent_hashes)
 
     def set_torrent_limits(
@@ -408,7 +446,9 @@ class QbittorrentClient(BaseClient):
         download_limit: int | None = None,
         upload_limit: int | None = None,
     ) -> None:
-        torrent_hashes = [str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)]
+        torrent_hashes = [
+            str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)
+        ]
         if download_limit is not None:
             self.client.torrents_set_download_limit(
                 limit=download_limit,
@@ -421,7 +461,9 @@ class QbittorrentClient(BaseClient):
             )
 
     def move_queue(self, torrent_id: TorrentIdInput, direction: QueueDirection) -> None:
-        torrent_hashes = [str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)]
+        torrent_hashes = [
+            str(torrent_hash) for torrent_hash in self._normalize_torrent_ids(torrent_id)
+        ]
         queue_actions = {
             QueueDirection.TOP: self.client.torrents_top_priority,
             QueueDirection.BOTTOM: self.client.torrents_bottom_priority,
@@ -512,12 +554,36 @@ class QbittorrentClient(BaseClient):
 
     def get_client_stats(self) -> ClientStats:
         transfer_info = self.client.transfer_info()
-        return {
-            "download_speed": transfer_info.get("dl_info_speed", 0),
-            "upload_speed": transfer_info.get("up_info_speed", 0),
-            "download_limit": transfer_info.get("dl_rate_limit", 0),
-            "upload_limit": transfer_info.get("up_rate_limit", 0),
-        }
+        return ClientStats(
+            download_speed=best_effort_adapter_field(
+                transfer_info,
+                "dl_info_speed",
+                0,
+                logger=logger,
+                context="qBittorrent client stats",
+            ),
+            upload_speed=best_effort_adapter_field(
+                transfer_info,
+                "up_info_speed",
+                0,
+                logger=logger,
+                context="qBittorrent client stats",
+            ),
+            download_limit=best_effort_adapter_field(
+                transfer_info,
+                "dl_rate_limit",
+                0,
+                logger=logger,
+                context="qBittorrent client stats",
+            ),
+            upload_limit=best_effort_adapter_field(
+                transfer_info,
+                "up_rate_limit",
+                0,
+                logger=logger,
+                context="qBittorrent client stats",
+            ),
+        )
 
     def get_peer_info(self, torrent_id: int | str) -> TorrentPeerList:
         peer_data = self.client.sync_torrent_peers(torrent_hash=str(torrent_id))

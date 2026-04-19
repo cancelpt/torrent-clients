@@ -14,6 +14,11 @@ For Chinese documentation, see [README.zh-CN.md](README.zh-CN.md).
 pip install -e .
 ```
 
+## Supported Downloader Versions
+
+- qBittorrent: this project currently pins `qbittorrent-api>=2024.10.68,<2024.11`. Upstream `qbittorrent-api` v2024.10.68 is a qBittorrent Web API client for qBittorrent `v4.1+` and explicitly advertises support for qBittorrent `v5.0.1` (Web API `v2.11.2`). In practice, this repository currently targets qBittorrent `4.x` through `5.0.1`, and includes compatibility for the qB 5 `start/stop` vs legacy `resume/pause` naming change. qBittorrent `5.1+` may work, but is not currently documented as supported by this pinned dependency line.
+- Transmission: this project currently pins `transmission-rpc>=7.0.11,<8`. Upstream `transmission-rpc` v7.0.11 documents support for Transmission `2.40` through `4.0.6`. Newer Transmission releases may still work, but newer RPC fields or features may be missing until the dependency is updated.
+
 ## Quick Start
 
 ```python

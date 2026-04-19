@@ -12,6 +12,11 @@
 pip install -e .
 ```
 
+## 支持的下载器版本
+
+- qBittorrent：当前项目固定依赖 `qbittorrent-api>=2024.10.68,<2024.11`。上游 `qbittorrent-api` `v2024.10.68` 本身是面向 qBittorrent `v4.1+` 的 Web API 客户端，并明确声明支持 qBittorrent `v5.0.1`（Web API `v2.11.2`）。结合本仓库现有兼容处理，当前可文档化的目标范围可保守理解为 qBittorrent `4.x` 到 `5.0.1`；其中 qB 5 的 `start/stop` 与旧版 `resume/pause` 命名差异已在适配层兼容。qBittorrent `5.1+` 可能可用，但当前这条依赖线下还没有被文档化为正式支持范围。
+- Transmission：当前项目固定依赖 `transmission-rpc>=7.0.11,<8`。上游 `transmission-rpc` `v7.0.11` 文档声明支持 Transmission `2.40` 到 `4.0.6`。更新的 Transmission 版本可能仍可工作，但若出现新的 RPC 字段或特性，可能需要先升级依赖后才能完整支持。
+
 ## 快速开始
 
 ```python

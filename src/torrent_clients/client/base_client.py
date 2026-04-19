@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol, Sequence, TypeVar, Union, cast, runtime_checkable
+from typing import Any, Optional, Protocol, Sequence, TypeVar, Union, cast, runtime_checkable
 
 from torrent_clients.torrent.torrent_info import TorrentInfo, TorrentList
 from torrent_clients.torrent.torrent_peer import TorrentPeerList
@@ -14,7 +15,128 @@ from torrent_clients.torrent.torrent_tracker import TorrentTrackerList
 CapabilityT = TypeVar("CapabilityT")
 TorrentId = Union[int, str]
 TorrentIdInput = Union[TorrentId, Sequence[TorrentId]]
-ClientStats = Dict[str, Any]
+_MISSING_FIELD = object()
+
+
+class MissingAdapterFieldError(RuntimeError):
+    """Raised when a downloader payload omits a field the adapter requires."""
+
+
+def adapter_field_value(container: Any, key: str, default: Any = _MISSING_FIELD) -> Any:
+    """Fetch a raw downloader field from mapping-like or attribute-style payloads."""
+    value = _MISSING_FIELD
+    if isinstance(container, Mapping):
+        value = container.get(key, _MISSING_FIELD)
+    else:
+        getter = getattr(container, "get", None)
+        if callable(getter):
+            value = getter(key, _MISSING_FIELD)
+
+    if value is not _MISSING_FIELD:
+        return value
+
+    value = getattr(container, key, _MISSING_FIELD)
+    if value is _MISSING_FIELD:
+        return default
+    return value
+
+
+def require_adapter_field(container: Any, key: str, *, context: str) -> Any:
+    """Return a required downloader field or raise a descriptive adapter error."""
+    value = adapter_field_value(container, key, _MISSING_FIELD)
+    if value is _MISSING_FIELD:
+        raise MissingAdapterFieldError(f"{context} missing required field '{key}'")
+    return value
+
+
+def optional_adapter_field(container: Any, key: str, default: Any) -> Any:
+    """Return an optional downloader field while preserving explicit falsy values."""
+    value = adapter_field_value(container, key, _MISSING_FIELD)
+    if value is _MISSING_FIELD:
+        return default
+    return value
+
+
+def best_effort_adapter_field(
+    container: Any,
+    key: str,
+    default: Any,
+    *,
+    logger: Any,
+    context: str,
+) -> Any:
+    """Return a best-effort field and log when a fallback is used for a missing key."""
+    value = adapter_field_value(container, key, _MISSING_FIELD)
+    if value is _MISSING_FIELD:
+        logger.warning("%s missing expected field '%s'; using fallback %r", context, key, default)
+        return default
+    return value
+
+
+@dataclass(frozen=True, eq=False)
+class ClientStats(Mapping[str, Any]):
+    """Structured client/session statistics with mapping-style compatibility."""
+
+    download_speed: int
+    upload_speed: int
+    download_limit: int
+    upload_limit: int
+    download_limited: bool | None = None
+    upload_limited: bool | None = None
+
+    def _mapping(self) -> dict[str, Any]:
+        values = {
+            "download_speed": self.download_speed,
+            "upload_speed": self.upload_speed,
+            "download_limit": self.download_limit,
+            "upload_limit": self.upload_limit,
+        }
+        if self.download_limited is not None:
+            values["download_limited"] = self.download_limited
+        if self.upload_limited is not None:
+            values["upload_limited"] = self.upload_limited
+        return values
+
+    def __getitem__(self, key: str) -> Any:
+        return self._mapping()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._mapping())
+
+    def __len__(self) -> int:
+        return len(self._mapping())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._mapping().get(key, default)
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._mapping()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ClientStats):
+            return (
+                self.download_speed == other.download_speed
+                and self.upload_speed == other.upload_speed
+                and self.download_limit == other.download_limit
+                and self.upload_limit == other.upload_limit
+                and self.download_limited == other.download_limited
+                and self.upload_limited == other.upload_limited
+            )
+        if isinstance(other, Mapping):
+            return self.to_dict() == dict(other.items())
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.download_speed,
+                self.upload_speed,
+                self.download_limit,
+                self.upload_limit,
+                self.download_limited,
+                self.upload_limited,
+            )
+        )
 
 
 @dataclass(frozen=True)

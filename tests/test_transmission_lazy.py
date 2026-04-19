@@ -7,8 +7,8 @@ import pytest
 
 from torrent_clients.client.transmission_client import (
     MissingTorrentFieldError,
-    TrTorrentFileList,
     TransmissionClient,
+    TrTorrentFileList,
 )
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from torrent_clients.client.qbittorrent_client import QbittorrentClient
 from torrent_clients.client.transmission_client import TransmissionClient
 from torrent_clients.client_helper import fetch_torrent_snapshots
@@ -131,6 +133,37 @@ def test_qb_client_get_torrents_snapshot_normalizes_status_and_labels() -> None:
     snapshot = snapshots[0]
     assert snapshot.status == "stopped"
     assert snapshot.labels == ["A", "B"]
+
+
+def test_qb_client_get_torrents_snapshot_raises_for_missing_required_hash() -> None:
+    client = QbittorrentClient("http://127.0.0.1:8080/", "", "", name="qb")
+    stub = _QbRPCStub()
+
+    class _MissingHashSnapshot(_FakeQbSnapshot):
+        def __init__(self) -> None:
+            super().__init__(
+                hash_value="hash-qb",
+                name="Demo",
+                save_path="/downloads",
+                progress=1.0,
+                total_size=100,
+                size=100,
+                completed=100,
+                tags="",
+                state="pausedUP",
+                added_on=123,
+            )
+            del self.hash
+
+    def _broken_torrents_info(**kwargs):  # type: ignore[no-untyped-def]
+        stub.last_info_kwargs = kwargs
+        return [_MissingHashSnapshot()]
+
+    stub.torrents_info = _broken_torrents_info  # type: ignore[method-assign]
+    client.client = stub
+
+    with pytest.raises(RuntimeError, match="missing required field.*hash"):
+        client.get_torrents_snapshot()
 
 
 class _TransmissionRPCStub:

@@ -154,7 +154,9 @@ def test_qb_lazyload_is_faster_than_non_lazy_when_only_file_list_is_needed() -> 
 def test_torrent_file_list_reuses_transformed_entries_across_access_patterns() -> None:
     class _CountingTorrentFileList(TorrentFileList):
         def __init__(self) -> None:
-            super().__init__("demo", raw=[[{"name": "a.bin", "size": 10}, {"name": "b.bin", "size": 20}]])
+            super().__init__(
+                "demo", raw=[[{"name": "a.bin", "size": 10}, {"name": "b.bin", "size": 20}]]
+            )
             self.transform_calls = 0
 
         def transform(self, file_data):  # type: ignore[no-untyped-def]
@@ -241,3 +243,15 @@ def test_qb_torrent_file_list_iter_file_entries_is_adapter_opt_in_and_preserves_
         {"path": "b.bin", "origin": "b.bin", "size": 20},
     ]
     assert file_list.transform_calls == 0
+
+
+def test_qb_torrent_file_list_preserves_non_zero_priority_as_wanted() -> None:
+    file_list = QbTorrentFileList(
+        "demo",
+        raw=[[{"name": "movie.mkv", "size": 123, "progress": 0.5, "priority": 7}]],
+    )
+
+    file_entry = file_list[0]
+
+    assert file_entry.priority == 7
+    assert file_entry.wanted is True

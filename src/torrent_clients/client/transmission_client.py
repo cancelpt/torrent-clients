@@ -16,6 +16,9 @@ from torrent_clients.client.base_client import (
     TorrentIdInput,
     TorrentQuery,
     TorrentSnapshot,
+    best_effort_adapter_field,
+    optional_adapter_field,
+    require_adapter_field,
 )
 from torrent_clients.torrent.torrent_file import TorrentFile, TorrentFileList
 from torrent_clients.torrent.torrent_info import TorrentInfo, TorrentList
@@ -134,7 +137,7 @@ class TrTorrentFileList(TorrentFileList):
 class TrTorrentTrackerList(TorrentTrackerList):
     def transform(self, tracker_data: Dict[str, Any]) -> Optional[TorrentTracker]:
         # 提取 'announce' 字段
-        announce_url = tracker_data.get("announce", "")
+        announce_url = optional_adapter_field(tracker_data, "announce", "")
 
         # 验证URL
         if self.valid_url_pattern.match(announce_url):
@@ -142,19 +145,19 @@ class TrTorrentTrackerList(TorrentTrackerList):
             default_count = -1
             return TorrentTracker(
                 url=announce_url,
-                downloaded=tracker_data.get("downloaded", default_count),
-                seeder=tracker_data.get("seeder_count", default_count),
-                leecher=tracker_data.get("leecher_count", default_count),
+                downloaded=optional_adapter_field(tracker_data, "downloaded", default_count),
+                seeder=optional_adapter_field(tracker_data, "seeder_count", default_count),
+                leecher=optional_adapter_field(tracker_data, "leecher_count", default_count),
                 peers=default_count,
-                info=tracker_data.get("last_announce_result", ""),
+                info=optional_adapter_field(tracker_data, "last_announce_result", ""),
             )
         return None
 
 
 class TrTorrentList(TorrentList):
     def transform(self, torrent_data: Torrent) -> TorrentInfo:
-        torrent_id = torrent_data.get("id", -1)
-        name = torrent_data.get("name", "")
+        torrent_id = require_adapter_field(torrent_data, "id", context="Transmission torrent")
+        name = require_adapter_field(torrent_data, "name", context="Transmission torrent")
 
         # 如果文件名包含非法字符
         if find_invalid_characters(name):
@@ -171,38 +174,38 @@ class TrTorrentList(TorrentList):
         else:
             trackers = TrTorrentTrackerList(raw=[])
 
-        labels = torrent_data.get("labels", [])
+        labels = optional_adapter_field(torrent_data, "labels", [])
         if len(labels) > 0:
             category = labels[0]
         else:
             category = ""
 
         # 转换状态
-        origin_status = torrent_data.get("status", "unknown")
+        origin_status = optional_adapter_field(torrent_data, "status", "unknown")
 
         status = convert_status(origin_status, DownloaderKind.TRANSMISSION)
 
         return TorrentInfo(
             id=torrent_id,
             name=name,
-            hash_string=torrent_data.get("hashString", ""),
-            download_dir=torrent_data.get("downloadDir", ""),
-            size=torrent_data.get("totalSize", 0),
-            progress=torrent_data.get("percentDone", 0),
+            hash_string=optional_adapter_field(torrent_data, "hashString", ""),
+            download_dir=optional_adapter_field(torrent_data, "downloadDir", ""),
+            size=optional_adapter_field(torrent_data, "totalSize", 0),
+            progress=optional_adapter_field(torrent_data, "percentDone", 0),
             status=status,
-            download_speed=torrent_data.get("rateDownload", 0),
-            upload_speed=torrent_data.get("rateUpload", 0),
+            download_speed=optional_adapter_field(torrent_data, "rateDownload", 0),
+            upload_speed=optional_adapter_field(torrent_data, "rateUpload", 0),
             files=files,
             trackers=trackers,
             labels=labels,
             category=category,
-            completed_size=torrent_data.get("haveValid", 0),
-            uploaded_size=torrent_data.get("uploadedEver", 0),
-            selected_size=torrent_data.get("sizeWhenDone", 0),
-            num_seeds=torrent_data.get("peersSendingToUs", -1),
-            num_leechs=torrent_data.get("peersGettingFromUs", -1),
-            added_on=torrent_data.get("addedDate", -1),
-            comment=torrent_data.get("comment", ""),
+            completed_size=optional_adapter_field(torrent_data, "haveValid", 0),
+            uploaded_size=optional_adapter_field(torrent_data, "uploadedEver", 0),
+            selected_size=optional_adapter_field(torrent_data, "sizeWhenDone", 0),
+            num_seeds=optional_adapter_field(torrent_data, "peersSendingToUs", -1),
+            num_leechs=optional_adapter_field(torrent_data, "peersGettingFromUs", -1),
+            added_on=optional_adapter_field(torrent_data, "addedDate", -1),
+            comment=optional_adapter_field(torrent_data, "comment", ""),
         )
 
 
@@ -274,15 +277,12 @@ class TrLazyFieldResolver:
 
         self._group_access_count = {group: 0 for group in _LAZY_GROUP_FIELDS}
         self._group_promoted = {group: False for group in _LAZY_GROUP_FIELDS}
-        self._group_pending_ids = {
-            group: set(torrent_ids)
-            for group in _LAZY_GROUP_FIELDS
-        }
+        self._group_pending_ids = {group: set(torrent_ids) for group in _LAZY_GROUP_FIELDS}
 
     def seed_from_torrent(self, torrent_data: Torrent) -> None:
-        torrent_id = int(torrent_data.get("id", -1))
-        if torrent_id < 0:
-            return
+        torrent_id = int(
+            require_adapter_field(torrent_data, "id", context="Transmission lazy torrent")
+        )
 
         loaded = self._loaded_fields.setdefault(torrent_id, set())
         values = self._values.setdefault(torrent_id, {})
@@ -354,7 +354,7 @@ class TrLazyFieldResolver:
 
         requested_fields = ["id", *list(fields)]
         for idx in range(0, len(ids), self._batch_size):
-            batch_ids = ids[idx: idx + self._batch_size]
+            batch_ids = ids[idx : idx + self._batch_size]
             try:
                 torrents = self._client.get_torrents(ids=batch_ids, arguments=requested_fields)
             except TypeError:
@@ -493,7 +493,9 @@ class TransmissionClient(BaseClient):
         torrent_ids = self._normalize_torrent_ids(torrent_id)
         self.client.remove_torrent(torrent_ids, delete_data=delete_data)
 
-    def get_torrents(self, status: str | None = None, query: TorrentQuery | None = None) -> TrTorrentList:
+    def get_torrents(
+        self, status: str | None = None, query: TorrentQuery | None = None
+    ) -> TrTorrentList:
         if self.client is None:
             self.login()
 
@@ -538,30 +540,43 @@ class TransmissionClient(BaseClient):
             temp_torrents = [
                 torrent
                 for torrent in temp_torrents
-                if convert_status(torrent.get("status", "unknown"), DownloaderKind.TRANSMISSION)
+                if convert_status(
+                    optional_adapter_field(torrent, "status", "unknown"),
+                    DownloaderKind.TRANSMISSION,
+                )
                 == target_status
             ]
 
         snapshots: list[TorrentSnapshot] = []
         for torrent_data in temp_torrents:
-            labels = _normalize_snapshot_labels(list(torrent_data.get("labels", []) or []))
+            labels = _normalize_snapshot_labels(
+                list(optional_adapter_field(torrent_data, "labels", []) or [])
+            )
             status = convert_status(
-                torrent_data.get("status", "unknown"),
+                optional_adapter_field(torrent_data, "status", "unknown"),
                 DownloaderKind.TRANSMISSION,
             )
             snapshots.append(
                 TorrentSnapshot(
-                    id=torrent_data.get("id", -1),
-                    hash_string=torrent_data.get("hashString", ""),
-                    name=torrent_data.get("name", ""),
-                    download_dir=torrent_data.get("downloadDir", ""),
-                    progress=float(torrent_data.get("percentDone", 0) or 0),
-                    size=int(torrent_data.get("totalSize", 0) or 0),
-                    selected_size=int(torrent_data.get("sizeWhenDone", 0) or 0),
-                    completed_size=int(torrent_data.get("haveValid", 0) or 0),
+                    id=require_adapter_field(
+                        torrent_data,
+                        "id",
+                        context="Transmission snapshot",
+                    ),
+                    hash_string=optional_adapter_field(torrent_data, "hashString", ""),
+                    name=require_adapter_field(
+                        torrent_data,
+                        "name",
+                        context="Transmission snapshot",
+                    ),
+                    download_dir=optional_adapter_field(torrent_data, "downloadDir", ""),
+                    progress=float(optional_adapter_field(torrent_data, "percentDone", 0) or 0),
+                    size=int(optional_adapter_field(torrent_data, "totalSize", 0) or 0),
+                    selected_size=int(optional_adapter_field(torrent_data, "sizeWhenDone", 0) or 0),
+                    completed_size=int(optional_adapter_field(torrent_data, "haveValid", 0) or 0),
                     labels=labels,
                     status=status.value,
-                    added_on=torrent_data.get("addedDate", None),
+                    added_on=optional_adapter_field(torrent_data, "addedDate", None),
                 )
             )
 
@@ -587,7 +602,10 @@ class TransmissionClient(BaseClient):
             requested_arguments.append("id")
 
         temp_torrents = self.client.get_torrents(arguments=requested_arguments)
-        torrent_ids = [int(torrent.get("id")) for torrent in temp_torrents]
+        torrent_ids = [
+            int(require_adapter_field(torrent, "id", context="Transmission lazy torrent"))
+            for torrent in temp_torrents
+        ]
         resolver = TrLazyFieldResolver(
             client=self.client,
             torrent_ids=torrent_ids,
@@ -598,9 +616,13 @@ class TransmissionClient(BaseClient):
         for torrent_data in temp_torrents:
             resolver.seed_from_torrent(torrent_data)
 
-        return TrLazyTorrentList(raw=[TrLazyTorrentInfo(resolver, torrent_id) for torrent_id in torrent_ids])
+        return TrLazyTorrentList(
+            raw=[TrLazyTorrentInfo(resolver, torrent_id) for torrent_id in torrent_ids]
+        )
 
-    def move_torrent(self, torrent: TorrentInfo, download_dir: str, move_files: bool = True) -> bool:
+    def move_torrent(
+        self, torrent: TorrentInfo, download_dir: str, move_files: bool = True
+    ) -> bool:
         try:
             self.client.move_torrent_data(
                 torrent.id, location=download_dir, move=move_files, timeout=20
@@ -813,24 +835,54 @@ class TransmissionClient(BaseClient):
     def get_client_stats(self) -> ClientStats:
         session = self.client.get_session()
         stats = self.client.session_stats()
-        return {
-            "download_speed": self._container_value(stats, "downloadSpeed", 0),
-            "upload_speed": self._container_value(stats, "uploadSpeed", 0),
-            "download_limit": self._container_value(session, "speed_limit_down", 0),
-            "upload_limit": self._container_value(session, "speed_limit_up", 0),
-            "download_limited": self._container_value(session, "speed_limit_down_enabled", False),
-            "upload_limited": self._container_value(session, "speed_limit_up_enabled", False),
-        }
+        return ClientStats(
+            download_speed=best_effort_adapter_field(
+                stats,
+                "downloadSpeed",
+                0,
+                logger=logger,
+                context="Transmission client stats",
+            ),
+            upload_speed=best_effort_adapter_field(
+                stats,
+                "uploadSpeed",
+                0,
+                logger=logger,
+                context="Transmission client stats",
+            ),
+            download_limit=best_effort_adapter_field(
+                session,
+                "speed_limit_down",
+                0,
+                logger=logger,
+                context="Transmission client session",
+            ),
+            upload_limit=best_effort_adapter_field(
+                session,
+                "speed_limit_up",
+                0,
+                logger=logger,
+                context="Transmission client session",
+            ),
+            download_limited=best_effort_adapter_field(
+                session,
+                "speed_limit_down_enabled",
+                False,
+                logger=logger,
+                context="Transmission client session",
+            ),
+            upload_limited=best_effort_adapter_field(
+                session,
+                "speed_limit_up_enabled",
+                False,
+                logger=logger,
+                context="Transmission client session",
+            ),
+        )
 
-    @staticmethod
-    def _container_value(container: Any, key: str, default: Any) -> Any:
-        if isinstance(container, dict):
-            return container.get(key, default)
-        if hasattr(container, "get"):
-            return container.get(key, default)
-        return getattr(container, key, default)
-
-    def _tracker_ids_from_urls(self, torrent_id: TorrentId, tracker_urls: Sequence[str]) -> list[int]:
+    def _tracker_ids_from_urls(
+        self, torrent_id: TorrentId, tracker_urls: Sequence[str]
+    ) -> list[int]:
         if not tracker_urls:
             return []
         torrent = self.client.get_torrent(torrent_id, arguments=["id", "trackerStats"])
