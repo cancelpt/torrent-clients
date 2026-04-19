@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import time
-
 from torrent_clients.client.qbittorrent_client import (
     QbTorrentFileList,
     QbTorrentList,
-    QbTorrentTrackerList,
 )
 from torrent_clients.torrent.torrent_file import TorrentFile, TorrentFileList
-from torrent_clients.torrent.torrent_info import TorrentInfo
-from torrent_clients.torrent.torrent_status import DownloaderKind, convert_status
 
 
 class SlowFakeTorrentData(dict):
-    def __init__(self, delay_seconds: float = 0.0) -> None:
+    def __init__(self) -> None:
         super().__init__(
             save_path="/tmp",
             total_size=10,
@@ -30,7 +25,6 @@ class SlowFakeTorrentData(dict):
             tags="",
             state="downloading",
         )
-        self.delay_seconds = delay_seconds
         self.files_calls = 0
         self.trackers_calls = 0
         self.properties_calls = 0
@@ -40,15 +34,11 @@ class SlowFakeTorrentData(dict):
     @property
     def files(self):  # type: ignore[no-untyped-def]
         self.files_calls += 1
-        if self.delay_seconds > 0:
-            time.sleep(self.delay_seconds)
         return [{"name": "a.bin", "size": 10, "progress": 0.5}]
 
     @property
     def trackers(self):  # type: ignore[no-untyped-def]
         self.trackers_calls += 1
-        if self.delay_seconds > 0:
-            time.sleep(self.delay_seconds)
         return [
             {
                 "url": "http://tracker.local/announce",
@@ -63,92 +53,51 @@ class SlowFakeTorrentData(dict):
     @property
     def properties(self):  # type: ignore[no-untyped-def]
         self.properties_calls += 1
-        if self.delay_seconds > 0:
-            time.sleep(self.delay_seconds)
         return {"comment": "hello"}
 
 
-def _non_lazy_transform(torrent_data: SlowFakeTorrentData) -> TorrentInfo:
-    torrent_hash = torrent_data.hash
-    tags = torrent_data.get("tags", "")
-    labels = [label.strip() for label in tags.split(",")] if tags else []
-
-    return TorrentInfo(
-        id=torrent_hash,
-        name=torrent_data.name,
-        hash_string=torrent_hash,
-        download_dir=torrent_data.get("save_path"),
-        size=torrent_data.get("total_size", 0),
-        progress=torrent_data.get("progress", 0),
-        status=convert_status(
-            torrent_data.get("state", "unknown"),
-            DownloaderKind.QBITTORRENT,
-        ),
-        download_speed=torrent_data.get("dlspeed", 0),
-        upload_speed=torrent_data.get("upspeed", 0),
-        labels=labels,
-        files=QbTorrentFileList(torrent_hash, raw=[torrent_data.files]),
-        trackers=QbTorrentTrackerList(raw=torrent_data.trackers),
-        completed_size=torrent_data.get("completed", 0),
-        selected_size=torrent_data.get("size", 0),
-        category=torrent_data.get("category", ""),
-        uploaded_size=torrent_data.get("uploaded", 0),
-        num_leechs=torrent_data.get("num_leechs", -1),
-        num_seeds=torrent_data.get("num_seeds", -1),
-        added_on=torrent_data.get("added_on", -1),
-        comment=torrent_data.properties.get("comment", ""),
-    )
-
-
-def test_qb_lazyload_only_loads_trackers_when_trackers_are_accessed() -> None:
+def test_qb_summary_transform_leaves_heavy_fields_unset() -> None:
     torrent_data = SlowFakeTorrentData()
     torrent_info = QbTorrentList(raw=[torrent_data])[0]
 
     assert torrent_data.files_calls == 0
     assert torrent_data.trackers_calls == 0
     assert torrent_data.properties_calls == 0
-
-    assert len(torrent_info.trackers) == 1
-    assert torrent_data.trackers_calls == 1
-    assert torrent_data.files_calls == 0
-    assert torrent_data.properties_calls == 0
+    assert torrent_info.files is None
+    assert torrent_info.trackers is None
+    assert torrent_info.comment is None
 
 
-def test_qb_lazyload_only_loads_files_when_file_list_is_accessed() -> None:
+def test_qb_transform_populates_files_when_transport_payload_includes_them() -> None:
     torrent_data = SlowFakeTorrentData()
+    torrent_data["files"] = [{"name": "a.bin", "size": 10, "progress": 0.5, "priority": 1}]
     torrent_info = QbTorrentList(raw=[torrent_data])[0]
 
-    assert torrent_data.files_calls == 0
     assert torrent_data.trackers_calls == 0
     assert torrent_data.properties_calls == 0
-
-    assert len(torrent_info.files) == 1
-    assert torrent_data.files_calls == 1
-    assert torrent_data.trackers_calls == 0
-    assert torrent_data.properties_calls == 0
+    assert [(file.name, file.priority, file.wanted) for file in torrent_info.files] == [
+        ("a.bin", 1, True)
+    ]
 
 
-def test_qb_lazyload_is_faster_than_non_lazy_when_only_file_list_is_needed() -> None:
-    rounds = 8
-    delay_seconds = 0.01
+def test_qb_transform_populates_trackers_and_comment_when_transport_payload_includes_them() -> None:
+    torrent_data = SlowFakeTorrentData()
+    torrent_data["trackers"] = [
+        {
+            "url": "http://tracker.local/announce",
+            "num_downloaded": 0,
+            "num_seeds": 0,
+            "num_leeches": 0,
+            "num_peers": 0,
+            "msg": "",
+        }
+    ]
+    torrent_data["comment"] = "hello"
+    torrent_info = QbTorrentList(raw=[torrent_data])[0]
 
-    lazy_start = time.perf_counter()
-    for _ in range(rounds):
-        torrent_data = SlowFakeTorrentData(delay_seconds=delay_seconds)
-        torrent_info = QbTorrentList(raw=[torrent_data])[0]
-        _ = len(torrent_info.files)
-    lazy_elapsed = time.perf_counter() - lazy_start
-
-    non_lazy_start = time.perf_counter()
-    for _ in range(rounds):
-        torrent_data = SlowFakeTorrentData(delay_seconds=delay_seconds)
-        torrent_info = _non_lazy_transform(torrent_data)
-        _ = len(torrent_info.files)
-    non_lazy_elapsed = time.perf_counter() - non_lazy_start
-
-    assert lazy_elapsed < non_lazy_elapsed * 0.7, (
-        f"lazy={lazy_elapsed:.4f}s, non_lazy={non_lazy_elapsed:.4f}s"
-    )
+    assert torrent_info.trackers[0] is not None
+    assert torrent_info.trackers[0].url == "http://tracker.local/announce"
+    assert torrent_info.comment == "hello"
 
 
 def test_torrent_file_list_reuses_transformed_entries_across_access_patterns() -> None:

@@ -23,7 +23,7 @@ def test_lazy_proxy_loads_on_first_access_and_caches() -> None:
     assert calls["count"] == 1
 
 
-def test_qbtorrent_list_preserves_lazy_fields_until_access() -> None:
+def test_qbtorrent_list_leaves_heavy_fields_unset_without_detail_payloads() -> None:
     class FakeTorrentData(dict):
         def __init__(self) -> None:
             super().__init__(
@@ -79,11 +79,6 @@ def test_qbtorrent_list_preserves_lazy_fields_until_access() -> None:
     assert torrent_data.trackers_calls == 0
     assert torrent_data.properties_calls == 0
 
-    assert torrent_info.files[0].name == "a.bin"
-    assert torrent_data.files_calls == 1
-
-    assert torrent_info.trackers[0].url.startswith("http://")
-    assert torrent_data.trackers_calls == 1
-
-    assert str(torrent_info.comment) == "hello"
-    assert torrent_data.properties_calls == 1
+    assert torrent_info.files is None
+    assert torrent_info.trackers is None
+    assert torrent_info.comment is None

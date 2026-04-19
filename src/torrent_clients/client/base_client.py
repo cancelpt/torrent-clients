@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator
 from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass
@@ -215,6 +216,14 @@ class SupportsLazyTorrentFetch(Protocol):
         """Fetch torrents through lazy/hybrid strategy."""
 
 
+@runtime_checkable
+class SupportsCategoryManagement(Protocol):
+    """Capability protocol for downloaders with native category support."""
+
+    def set_category(self, torrent_id: int | str, category: str) -> None:
+        """Set category for a torrent in downloader-specific implementations."""
+
+
 class BaseClient:
     """Base class for downloaders."""
 
@@ -266,10 +275,22 @@ class BaseClient:
 
     def supports_capability(self, capability: type[CapabilityT]) -> bool:
         """Whether this client supports a downloader-specific capability protocol."""
+        if capability is SupportsLazyTorrentFetch:
+            warnings.warn(
+                "SupportsLazyTorrentFetch is deprecated; use explicit list/detail/hydrate APIs.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return isinstance(self, capability)
 
     def require_capability(self, capability: type[CapabilityT]) -> CapabilityT:
         """Return self as a capability interface or raise when unsupported."""
+        if capability is SupportsLazyTorrentFetch:
+            warnings.warn(
+                "SupportsLazyTorrentFetch is deprecated; use explicit list/detail/hydrate APIs.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if not self.supports_capability(capability):
             capability_name = getattr(capability, "__name__", str(capability))
             raise UnsupportedClientCapabilityError(
@@ -336,10 +357,6 @@ class BaseClient:
 
     def set_labels(self, torrent: TorrentInfo, labels: list[str]) -> None:
         """Set labels for a torrent."""
-        raise NotImplementedError("Subclasses must implement this method.")
-
-    def set_category(self, torrent_id: int | str, category: str) -> None:
-        """Set category for a torrent."""
         raise NotImplementedError("Subclasses must implement this method.")
 
     def recheck_torrent(self, torrent_id: TorrentIdInput) -> None:

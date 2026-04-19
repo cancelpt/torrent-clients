@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Union
+from typing import Any, Callable, Iterable
 
-from torrent_clients.client.base_client import TorrentSnapshot
+from torrent_clients.client.base_client import BaseClient, TorrentSnapshot
 from torrent_clients.client.client_type import ClientType
 from torrent_clients.client.qbittorrent_client import QbittorrentClient
 from torrent_clients.client.transmission_client import TransmissionClient
 
-SupportedClient = Union[QbittorrentClient, TransmissionClient]
+SupportedClient = BaseClient
 
 
 def _normalize_client_type(dl_type: ClientType | str) -> ClientType:

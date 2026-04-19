@@ -6,7 +6,7 @@ from torrent_clients.client.transmission_client import TransmissionClient
 
 def _new_qb_client() -> QbittorrentClient:
     return QbittorrentClient(
-        "http://127.0.0.1:8080/",
+        "http://localhost:8080/",
         "",
         "",
         name="qb",
@@ -15,7 +15,7 @@ def _new_qb_client() -> QbittorrentClient:
 
 def _new_tr_client() -> TransmissionClient:
     return TransmissionClient(
-        "http://127.0.0.1:9091/",
+        "http://localhost:9091/",
         "",
         "",
         name="tr",
@@ -51,9 +51,13 @@ class _FakeTransmissionTorrent:
 
 
 class _QbRPCStub:
-    def __init__(self, response=None) -> None:
+    def __init__(self, response=None, files_by_hash=None, trackers_by_hash=None) -> None:
         self.last_info_kwargs = None
         self.response = response or []
+        self.files_by_hash = files_by_hash or {}
+        self.trackers_by_hash = trackers_by_hash or {}
+        self.files_calls = []
+        self.trackers_calls = []
 
     def auth_log_in(self) -> bool:
         return True
@@ -62,9 +66,23 @@ class _QbRPCStub:
         self.last_info_kwargs = kwargs
         return self.response
 
+    def torrents_files(self, *, torrent_hash):  # type: ignore[no-untyped-def]
+        self.files_calls.append(torrent_hash)
+        return self.files_by_hash.get(torrent_hash, [])
+
+    def torrents_trackers(self, *, torrent_hash=None):  # type: ignore[no-untyped-def]
+        self.trackers_calls.append(torrent_hash)
+        return self.trackers_by_hash.get(torrent_hash, [])
+
 
 class _FakeQbTorrent(dict):
-    def __init__(self, files: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        torrent_hash: str = "hash-a",
+        files: list[dict] | None = None,
+        trackers: list[dict] | None = None,
+    ) -> None:
         super().__init__(
             save_path="/downloads",
             total_size=123,
@@ -81,9 +99,10 @@ class _FakeQbTorrent(dict):
             tags="done",
             state="pausedUP",
         )
-        self.hash = "hash-a"
+        self.hash = torrent_hash
         self.name = "Movie"
         self._files = files or []
+        self._trackers = trackers or []
 
     @property
     def files(self):  # type: ignore[no-untyped-def]
@@ -91,7 +110,7 @@ class _FakeQbTorrent(dict):
 
     @property
     def trackers(self):  # type: ignore[no-untyped-def]
-        return []
+        return self._trackers
 
     @property
     def properties(self):  # type: ignore[no-untyped-def]
@@ -100,39 +119,43 @@ class _FakeQbTorrent(dict):
 
 def test_qb_hydrate_files_uses_torrent_id_query() -> None:
     client = _new_qb_client()
-    captured_queries = []
-
-    def _fake_get_torrents(status=None, query=None):  # type: ignore[no-untyped-def]
-        captured_queries.append((status, query))
-        return ["hydrated"]
-
-    client.get_torrents = _fake_get_torrents  # type: ignore[method-assign]
+    stub = _QbRPCStub(
+        response=[
+            _FakeQbTorrent(torrent_hash="hash-a"),
+            _FakeQbTorrent(torrent_hash="hash-b"),
+        ],
+        files_by_hash={
+            "hash-a": [{"name": "a.bin", "size": 10, "progress": 1.0, "priority": 1}],
+            "hash-b": [{"name": "b.bin", "size": 20, "progress": 1.0, "priority": 0}],
+        },
+    )
+    client.client = stub
 
     result = client.hydrate_files(["hash-a", "hash-b"])
 
-    assert result == ["hydrated"]
-    assert captured_queries[0][0] is None
-    assert captured_queries[0][1].torrent_ids == ["hash-a", "hash-b"]
+    assert len(result) == 2
+    assert stub.last_info_kwargs["torrent_hashes"] == ["hash-a", "hash-b"]
+    assert stub.files_calls == ["hash-a", "hash-b"]
 
 
 def test_qb_hydrate_files_returns_file_selection_metadata() -> None:
     client = _new_qb_client()
     stub = _QbRPCStub(
-        response=[
-            _FakeQbTorrent(
-                files=[
-                    {"name": "movie.mkv", "size": 123, "progress": 1.0, "priority": 0},
-                    {"name": "sample.mkv", "size": 23, "progress": 1.0, "priority": 6},
-                ]
-            )
-        ]
+        response=[_FakeQbTorrent(torrent_hash="hash-a")],
+        files_by_hash={
+            "hash-a": [
+                {"name": "movie.mkv", "size": 123, "progress": 1.0, "priority": 0},
+                {"name": "sample.mkv", "size": 23, "progress": 1.0, "priority": 6},
+            ]
+        },
     )
     client.client = stub
 
     result = client.hydrate_files(["hash-a"])
     torrent = result[0]
 
-    assert stub.last_info_kwargs == {"status_filter": None, "torrent_hashes": ["hash-a"]}
+    assert stub.last_info_kwargs["torrent_hashes"] == ["hash-a"]
+    assert stub.files_calls == ["hash-a"]
     assert [(file.name, file.priority, file.wanted) for file in torrent.files] == [
         ("movie.mkv", 0, False),
         ("sample.mkv", 6, True),
@@ -161,6 +184,11 @@ def test_transmission_hydrate_files_requests_file_arguments() -> None:
                 "labels",
                 "status",
                 "addedDate",
+                "rateDownload",
+                "rateUpload",
+                "uploadedEver",
+                "peersSendingToUs",
+                "peersGettingFromUs",
                 "files",
                 "fileStats",
             ),
@@ -223,19 +251,23 @@ def test_transmission_hydrate_files_returns_file_metadata_needed_by_audit() -> N
 
 def test_qb_hydrate_trackers_uses_torrent_id_query() -> None:
     client = _new_qb_client()
-    captured_queries = []
-
-    def _fake_get_torrents(status=None, query=None):  # type: ignore[no-untyped-def]
-        captured_queries.append((status, query))
-        return ["hydrated"]
-
-    client.get_torrents = _fake_get_torrents  # type: ignore[method-assign]
+    stub = _QbRPCStub(
+        response=[
+            _FakeQbTorrent(torrent_hash="hash-a"),
+            _FakeQbTorrent(torrent_hash="hash-b"),
+        ],
+        trackers_by_hash={
+            "hash-a": [{"url": "https://tracker.example/a"}],
+            "hash-b": [{"url": "https://tracker.example/b"}],
+        },
+    )
+    client.client = stub
 
     result = client.hydrate_trackers(["hash-a", "hash-b"])
 
-    assert result == ["hydrated"]
-    assert captured_queries[0][0] is None
-    assert captured_queries[0][1].torrent_ids == ["hash-a", "hash-b"]
+    assert len(result) == 2
+    assert stub.last_info_kwargs["torrent_hashes"] == ["hash-a", "hash-b"]
+    assert stub.trackers_calls == ["hash-a", "hash-b"]
 
 
 def test_transmission_hydrate_trackers_requests_tracker_fields() -> None:
@@ -262,7 +294,25 @@ def test_transmission_hydrate_trackers_requests_tracker_fields() -> None:
     assert stub.get_torrents_calls == [
         {
             "ids": (1,),
-            "arguments": ("id", "hashString", "name", "downloadDir", "trackerStats"),
+            "arguments": (
+                "id",
+                "hashString",
+                "name",
+                "downloadDir",
+                "percentDone",
+                "totalSize",
+                "sizeWhenDone",
+                "haveValid",
+                "labels",
+                "status",
+                "addedDate",
+                "rateDownload",
+                "rateUpload",
+                "uploadedEver",
+                "peersSendingToUs",
+                "peersGettingFromUs",
+                "trackerStats",
+            ),
         }
     ]
     assert [tracker.url for tracker in torrent.trackers] == ["https://tracker.example/announce"]

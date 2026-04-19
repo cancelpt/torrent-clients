@@ -102,7 +102,7 @@ class _FakeQbSnapshot:
 
 
 def test_qb_client_get_torrents_snapshot_requests_lightweight_fields() -> None:
-    client = QbittorrentClient("http://127.0.0.1:8080/", "", "", name="qb")
+    client = QbittorrentClient("http://localhost:8080/", "", "", name="qb")
     stub = _QbRPCStub()
     client.client = stub
 
@@ -123,7 +123,7 @@ def test_qb_client_get_torrents_snapshot_requests_lightweight_fields() -> None:
 
 
 def test_qb_client_get_torrents_snapshot_normalizes_status_and_labels() -> None:
-    client = QbittorrentClient("http://127.0.0.1:8080/", "", "", name="qb")
+    client = QbittorrentClient("http://localhost:8080/", "", "", name="qb")
     stub = _QbRPCStub()
     client.client = stub
 
@@ -136,7 +136,7 @@ def test_qb_client_get_torrents_snapshot_normalizes_status_and_labels() -> None:
 
 
 def test_qb_client_get_torrents_snapshot_raises_for_missing_required_hash() -> None:
-    client = QbittorrentClient("http://127.0.0.1:8080/", "", "", name="qb")
+    client = QbittorrentClient("http://localhost:8080/", "", "", name="qb")
     stub = _QbRPCStub()
 
     class _MissingHashSnapshot(_FakeQbSnapshot):
@@ -195,7 +195,7 @@ class _TransmissionRPCStub:
 
 
 def test_transmission_client_get_torrents_snapshot_requests_lightweight_fields() -> None:
-    client = TransmissionClient("http://127.0.0.1:9091/", "", "", name="tr")
+    client = TransmissionClient("http://localhost:9091/", "", "", name="tr")
     stub = _TransmissionRPCStub()
     client.client = stub
 
@@ -222,7 +222,7 @@ def test_transmission_client_get_torrents_snapshot_requests_lightweight_fields()
 
 
 def test_transmission_client_get_torrents_snapshot_normalizes_status_and_labels() -> None:
-    client = TransmissionClient("http://127.0.0.1:9091/", "", "", name="tr")
+    client = TransmissionClient("http://localhost:9091/", "", "", name="tr")
     stub = _TransmissionRPCStub()
     client.client = stub
 

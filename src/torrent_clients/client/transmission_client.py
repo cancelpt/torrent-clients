@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from collections.abc import Iterable, Sequence
-from typing import Any, Dict, List, Literal, Optional, cast
-from urllib.parse import urlparse
-
-from transmission_rpc import Client, Torrent, error
+from typing import Any, Dict, List, Optional
 
 from torrent_clients.client.base_client import (
     BaseClient,
     ClientStats,
     QueueDirection,
+    SupportsCategoryManagement,
     TorrentId,
     TorrentIdInput,
     TorrentQuery,
     TorrentSnapshot,
+    UnsupportedClientCapabilityError,
     best_effort_adapter_field,
     optional_adapter_field,
     require_adapter_field,
@@ -25,6 +25,12 @@ from torrent_clients.torrent.torrent_info import TorrentInfo, TorrentList
 from torrent_clients.torrent.torrent_peer import TorrentPeer, TorrentPeerList
 from torrent_clients.torrent.torrent_status import DownloaderKind, TorrentStatus, convert_status
 from torrent_clients.torrent.torrent_tracker import TorrentTracker, TorrentTrackerList
+from torrent_clients.transport.errors import (
+    TransportAuthenticationError,
+    TransportConnectionError,
+    TransportProtocolError,
+)
+from torrent_clients.transport.transmission import TransmissionTransport
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,33 @@ _DEFAULT_EAGER_SCALAR_ARGUMENTS = (
     "addedDate",
     "hashString",
 )
+_SUMMARY_FIELDS = (
+    "id",
+    "hashString",
+    "name",
+    "downloadDir",
+    "percentDone",
+    "totalSize",
+    "sizeWhenDone",
+    "haveValid",
+    "labels",
+    "status",
+    "addedDate",
+    "rateDownload",
+    "rateUpload",
+    "uploadedEver",
+    "peersSendingToUs",
+    "peersGettingFromUs",
+)
+_DETAIL_FIELDS = (
+    *_SUMMARY_FIELDS,
+    "comment",
+    "files",
+    "fileStats",
+    "trackerStats",
+)
+_HYDRATE_FILE_FIELDS = (*_SUMMARY_FIELDS, "files", "fileStats")
+_HYDRATE_TRACKER_FIELDS = (*_SUMMARY_FIELDS, "trackerStats")
 _LAZY_GROUP_FIELDS = {
     "files": ("files", "fileStats"),
     "trackers": ("trackerStats",),
@@ -71,6 +104,21 @@ _SNAPSHOT_FIELDS = (
 )
 
 
+def _available_torrent_fields(torrent_data: Any) -> set[str]:
+    declared_fields = optional_adapter_field(torrent_data, "__fields__", None)
+    if declared_fields:
+        return {str(field) for field in declared_fields}
+
+    runtime_fields = getattr(torrent_data, "fields", None)
+    if runtime_fields:
+        return {str(field) for field in runtime_fields}
+
+    if isinstance(torrent_data, dict):
+        return {str(field) for field in torrent_data.keys() if field != "__fields__"}
+
+    return set()
+
+
 def _normalize_snapshot_labels(labels: list[str]) -> list[str]:
     cleaned = [label.strip() for label in labels if label and label.strip()]
     return sorted(set(cleaned))
@@ -86,7 +134,6 @@ class MissingTorrentFieldError(RuntimeError):
 
 
 def find_invalid_characters(s: str) -> list[str]:
-    # 返回所有不合法的字符
     return [char for char in s if invalid_file_name_pattern.match(char)]
 
 
@@ -110,9 +157,10 @@ class TrTorrentFileList(TorrentFileList):
         files = file_data[0]
         file_stats = file_data[1] if len(file_data) > 1 else {}
         file_name = files.get("name", "")
-        # 如果文件名包含非法字符
         if find_invalid_characters(file_name):
-            logger.debug("种子%s，文件名包含非法字符：%s", self.torrent_id, file_name)
+            logger.debug(
+                "torrent %s has invalid filename characters: %s", self.torrent_id, file_name
+            )
 
         return TorrentFile(
             name=files.get("name", ""),
@@ -136,12 +184,8 @@ class TrTorrentFileList(TorrentFileList):
 
 class TrTorrentTrackerList(TorrentTrackerList):
     def transform(self, tracker_data: Dict[str, Any]) -> Optional[TorrentTracker]:
-        # 提取 'announce' 字段
         announce_url = optional_adapter_field(tracker_data, "announce", "")
-
-        # 验证URL
         if self.valid_url_pattern.match(announce_url):
-            # 使用常量和字典的直接访问
             default_count = -1
             return TorrentTracker(
                 url=announce_url,
@@ -155,35 +199,37 @@ class TrTorrentTrackerList(TorrentTrackerList):
 
 
 class TrTorrentList(TorrentList):
-    def transform(self, torrent_data: Torrent) -> TorrentInfo:
+    def transform(self, torrent_data: Any) -> TorrentInfo:
         torrent_id = require_adapter_field(torrent_data, "id", context="Transmission torrent")
         name = require_adapter_field(torrent_data, "name", context="Transmission torrent")
 
-        # 如果文件名包含非法字符
         if find_invalid_characters(name):
-            logger.warning("种子%s，名称包含非法字符：%s", torrent_id, name)
-        file_data = []
-        if "files" in torrent_data.fields:
-            file_data.append(torrent_data.get("files", []))
-            if "fileStats" in torrent_data.fields:
-                file_data.append(torrent_data.get("fileStats", []))
+            logger.warning("torrent %s has invalid name characters: %s", torrent_id, name)
 
-        files = TrTorrentFileList(torrent_id, raw=file_data)
-        if "trackerStats" in torrent_data.fields:
-            trackers = TrTorrentTrackerList(raw=torrent_data.tracker_stats)
-        else:
-            trackers = TrTorrentTrackerList(raw=[])
+        available_fields = _available_torrent_fields(torrent_data)
 
-        labels = optional_adapter_field(torrent_data, "labels", [])
-        if len(labels) > 0:
-            category = labels[0]
-        else:
-            category = ""
+        files = None
+        if "files" in available_fields:
+            files_payload = list(optional_adapter_field(torrent_data, "files", []) or [])
+            file_stats_payload = list(optional_adapter_field(torrent_data, "fileStats", []) or [])
+            if len(file_stats_payload) == len(files_payload):
+                files = TrTorrentFileList(torrent_id, raw=[files_payload, file_stats_payload])
+            else:
+                files = TrTorrentFileList(torrent_id, raw=[files_payload])
 
-        # 转换状态
+        trackers = None
+        if "trackerStats" in available_fields:
+            trackers = TrTorrentTrackerList(
+                raw=list(optional_adapter_field(torrent_data, "trackerStats", []) or [])
+            )
+
+        labels = list(optional_adapter_field(torrent_data, "labels", []) or [])
+        category = labels[0] if labels else ""
         origin_status = optional_adapter_field(torrent_data, "status", "unknown")
-
         status = convert_status(origin_status, DownloaderKind.TRANSMISSION)
+        comment = None
+        if "comment" in available_fields:
+            comment = optional_adapter_field(torrent_data, "comment", "")
 
         return TorrentInfo(
             id=torrent_id,
@@ -205,7 +251,7 @@ class TrTorrentList(TorrentList):
             num_seeds=optional_adapter_field(torrent_data, "peersSendingToUs", -1),
             num_leechs=optional_adapter_field(torrent_data, "peersGettingFromUs", -1),
             added_on=optional_adapter_field(torrent_data, "addedDate", -1),
-            comment=optional_adapter_field(torrent_data, "comment", ""),
+            comment=comment,
         )
 
 
@@ -255,7 +301,7 @@ class TrLazyTorrentInfo:
 class TrLazyFieldResolver:
     def __init__(
         self,
-        client: Client,
+        client: Any,
         torrent_ids: list[int],
         strict_mode: bool = False,
         batch_size: int = 200,
@@ -279,17 +325,17 @@ class TrLazyFieldResolver:
         self._group_promoted = {group: False for group in _LAZY_GROUP_FIELDS}
         self._group_pending_ids = {group: set(torrent_ids) for group in _LAZY_GROUP_FIELDS}
 
-    def seed_from_torrent(self, torrent_data: Torrent) -> None:
+    def seed_from_torrent(self, torrent_data: Any) -> None:
         torrent_id = int(
             require_adapter_field(torrent_data, "id", context="Transmission lazy torrent")
         )
 
         loaded = self._loaded_fields.setdefault(torrent_id, set())
         values = self._values.setdefault(torrent_id, {})
-        fields = set(getattr(torrent_data, "fields", set()))
+        fields = _available_torrent_fields(torrent_data)
 
         for field in fields:
-            values[field] = torrent_data.get(field)
+            values[field] = optional_adapter_field(torrent_data, field, None)
             loaded.add(field)
 
         values["id"] = torrent_id
@@ -355,13 +401,7 @@ class TrLazyFieldResolver:
         requested_fields = ["id", *list(fields)]
         for idx in range(0, len(ids), self._batch_size):
             batch_ids = ids[idx : idx + self._batch_size]
-            try:
-                torrents = self._client.get_torrents(ids=batch_ids, arguments=requested_fields)
-            except TypeError:
-                torrents = [
-                    self._client.get_torrent(torrent_id, arguments=requested_fields)
-                    for torrent_id in batch_ids
-                ]
+            torrents = self._client.get_torrents(ids=batch_ids, arguments=requested_fields)
             for torrent_data in torrents:
                 self.seed_from_torrent(torrent_data)
 
@@ -394,35 +434,36 @@ class TransmissionClient(BaseClient):
         name: str | None = None,
     ) -> None:
         super().__init__(url, username, password, dl_type, name)
-        self.client = None
+        self.client = TransmissionTransport(self.url, self.username, self.password)
         self.dl_type = "transmission"
 
+    def _ensure_client(self) -> TransmissionTransport | Any:
+        if self.client is None:
+            self.client = TransmissionTransport(self.url, self.username, self.password)
+        return self.client
+
     def login(self) -> bool:
-        parsed_url = urlparse(self.url)
-        host = parsed_url.hostname
-        scheme = parsed_url.scheme
-        if scheme not in ["http", "https"]:
-            raise ValueError(f"Unsupported protocol: {scheme}")
-        scheme_literal = cast(Literal["http", "https"], scheme)
-        port = parsed_url.port or (80 if scheme == "http" else 443)
+        client = self._ensure_client()
+        if not hasattr(client, "get_session"):
+            return True
         try:
-            self.client = Client(
-                protocol=scheme_literal,
-                host=host,
-                port=port,
-                username=self.username,
-                password=self.password,
-            )
-            logger.info("Successfully connected to Transmission: %s", self.url)
-        except error.TransmissionError as e:
-            logger.error("Failed to connect to Transmission: %s, %s", self.url, e)
+            client.get_session()
+        except (TransportAuthenticationError, TransportConnectionError, TransportProtocolError):
             return False
-
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.error("Unknown error: %s, please check the URL %s", e, self.url)
-            return False
-
         return True
+
+    def supports_capability(self, capability: type[Any]) -> bool:
+        if capability is SupportsCategoryManagement:
+            return False
+        return super().supports_capability(capability)
+
+    def require_capability(self, capability: type[Any]):
+        if capability is SupportsCategoryManagement:
+            raise UnsupportedClientCapabilityError(
+                f"{self.__class__.__name__} does not support capability "
+                f"{getattr(capability, '__name__', capability)}"
+            )
+        return super().require_capability(capability)
 
     def add_torrent(
         self,
@@ -433,9 +474,9 @@ class TransmissionClient(BaseClient):
         is_paused: bool = True,
         skip_checking: bool = False,
     ) -> bool:
+        client = self._ensure_client()
 
         torrent_input = torrent_url
-
         try:
             _, torrent_input = self._prepare_torrent_input(torrent_input)
         except (FileNotFoundError, ValueError) as exc:
@@ -443,77 +484,89 @@ class TransmissionClient(BaseClient):
             return False
 
         try:
-            # 先加种子，暂停
-            result = self.client.add_torrent(torrent_input, download_dir=download_dir, paused=True)
-        except error.TransmissionError as e:
-            logger.error("添加种子失败：%s", e)
+            result = client.add_torrent(torrent_input, download_dir=download_dir, paused=True)
+        except (
+            TransportAuthenticationError,
+            TransportConnectionError,
+            TransportProtocolError,
+        ) as exc:
+            logger.error("add torrent failed: %s", exc)
             return False
 
-        if result:
-            if upload_limit is None:
-                upload_limit = -1
-            if download_limit is None:
-                download_limit = -1
-            # 重复确认限速是否生效，最大尝试次数为3
-            retry = 3
-            while retry > 0:
-                self.client.change_torrent(
-                    result.id,
-                    upload_limit=upload_limit,
-                    download_limit=download_limit,
-                    upload_limited=(upload_limit != -1),
-                    download_limited=(download_limit != -1),
-                )
-                torrent = self.client.get_torrent(result.id)
-                if (
-                    (upload_limit != -1 and torrent.upload_limit == upload_limit)
-                    or upload_limit == -1
-                ) and (
-                    (download_limit != -1 and torrent.download_limit == download_limit)
-                    or download_limit == -1
-                ):
-                    break
-                retry -= 1
-            if retry == 0:
-                logger.error("Cannnot set upload/download limit for torrent: %s", result.id)
-                return False
-            # 如果跳过检查
-            if skip_checking:
-                # 重新汇报种子（tr3跳校验）
-                self.client.reannounce_torrent(result.id)
-            # 开始下载
-            if not is_paused:
-                self.client.start_torrent(result.id)
-        else:
-            logger.error("Add torrent failed: %s", torrent_input)
+        if not result:
+            logger.error("add torrent failed: %s", torrent_input)
             return False
+
+        torrent_id = optional_adapter_field(result, "id", None)
+        if torrent_id is None:
+            return False
+
+        if upload_limit is None:
+            upload_limit = -1
+        if download_limit is None:
+            download_limit = -1
+
+        retry = 3
+        while retry > 0:
+            client.change_torrent(
+                torrent_id,
+                upload_limit=upload_limit,
+                download_limit=download_limit,
+                upload_limited=(upload_limit != -1),
+                download_limited=(download_limit != -1),
+            )
+            torrent = client.get_torrent(
+                torrent_id, arguments=["id", "upload_limit", "download_limit"]
+            )
+            current_upload_limit = optional_adapter_field(torrent, "upload_limit", None)
+            current_download_limit = optional_adapter_field(torrent, "download_limit", None)
+            if (
+                (upload_limit != -1 and current_upload_limit == upload_limit) or upload_limit == -1
+            ) and (
+                (download_limit != -1 and current_download_limit == download_limit)
+                or download_limit == -1
+            ):
+                break
+            retry -= 1
+        if retry == 0:
+            logger.error("cannot set upload/download limit for torrent: %s", torrent_id)
+            return False
+
+        if skip_checking:
+            client.reannounce_torrent(torrent_id)
+        if not is_paused:
+            client.start_torrent(torrent_id)
         return True
 
     def remove_torrent(self, torrent_id: TorrentIdInput, delete_data: bool = False) -> None:
-        torrent_ids = self._normalize_torrent_ids(torrent_id)
-        self.client.remove_torrent(torrent_ids, delete_data=delete_data)
+        self._ensure_client().remove_torrent(
+            self._normalize_torrent_ids(torrent_id),
+            delete_data=delete_data,
+        )
 
     def get_torrents(
         self, status: str | None = None, query: TorrentQuery | None = None
     ) -> TrTorrentList:
-        if self.client is None:
-            self.login()
-
-        # 如果还是None，说明登录失败
-        if self.client is None:
-            raise ValueError("Cannot login to Transmission.")
-
+        client = self._ensure_client()
         torrent_ids = list(query.torrent_ids) if query and query.torrent_ids else None
-        arguments = list(query.fields) if query and query.fields else None
-
-        temp_torrents = self.client.get_torrents(ids=torrent_ids, arguments=arguments)
+        if query and query.fields:
+            warnings.warn(
+                "TorrentQuery.fields is deprecated; use get_torrents() for summaries, "
+                "get_torrent_info() for detail, or hydrate_*() for heavy fields.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        temp_torrents = client.get_torrents(ids=torrent_ids, arguments=list(_SUMMARY_FIELDS))
 
         if status is not None:
             target_status = convert_status(status, DownloaderKind.TRANSMISSION)
             temp_torrents = [
                 torrent
                 for torrent in temp_torrents
-                if convert_status(torrent.get("status", "unknown"), DownloaderKind.TRANSMISSION)
+                if convert_status(
+                    optional_adapter_field(torrent, "status", "unknown"),
+                    DownloaderKind.TRANSMISSION,
+                )
                 == target_status
             ]
 
@@ -524,16 +577,9 @@ class TransmissionClient(BaseClient):
         status: str | None = None,
         query: TorrentQuery | None = None,
     ) -> list[TorrentSnapshot]:
-        if self.client is None:
-            self.login()
-
-        if self.client is None:
-            raise ValueError("Cannot login to Transmission.")
-
+        client = self._ensure_client()
         torrent_ids = list(query.torrent_ids) if query and query.torrent_ids else None
-        arguments = list(_SNAPSHOT_FIELDS)
-
-        temp_torrents = self.client.get_torrents(ids=torrent_ids, arguments=arguments)
+        temp_torrents = client.get_torrents(ids=torrent_ids, arguments=list(_SNAPSHOT_FIELDS))
 
         if status is not None:
             target_status = convert_status(status, DownloaderKind.TRANSMISSION)
@@ -552,17 +598,13 @@ class TransmissionClient(BaseClient):
             labels = _normalize_snapshot_labels(
                 list(optional_adapter_field(torrent_data, "labels", []) or [])
             )
-            status = convert_status(
+            status_value = convert_status(
                 optional_adapter_field(torrent_data, "status", "unknown"),
                 DownloaderKind.TRANSMISSION,
             )
             snapshots.append(
                 TorrentSnapshot(
-                    id=require_adapter_field(
-                        torrent_data,
-                        "id",
-                        context="Transmission snapshot",
-                    ),
+                    id=require_adapter_field(torrent_data, "id", context="Transmission snapshot"),
                     hash_string=optional_adapter_field(torrent_data, "hashString", ""),
                     name=require_adapter_field(
                         torrent_data,
@@ -575,7 +617,7 @@ class TransmissionClient(BaseClient):
                     selected_size=int(optional_adapter_field(torrent_data, "sizeWhenDone", 0) or 0),
                     completed_size=int(optional_adapter_field(torrent_data, "haveValid", 0) or 0),
                     labels=labels,
-                    status=status.value,
+                    status=status_value.value,
                     added_on=optional_adapter_field(torrent_data, "addedDate", None),
                 )
             )
@@ -588,12 +630,14 @@ class TransmissionClient(BaseClient):
         batch_size: int = 200,
         promote_thresholds: Optional[dict[str, int]] = None,
     ) -> TrLazyTorrentList:
-        if self.client is None:
-            self.login()
+        warnings.warn(
+            "get_torrents_lazy() is deprecated; use explicit get_torrents(), "
+            "get_torrent_info(), and hydrate_*() APIs.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
-        if self.client is None:
-            raise ValueError("Cannot login to Transmission.")
-
+        client = self._ensure_client()
         strict_mode = arguments is not None
         requested_arguments = (
             list(arguments) if strict_mode else list(_DEFAULT_EAGER_SCALAR_ARGUMENTS)
@@ -601,13 +645,13 @@ class TransmissionClient(BaseClient):
         if "id" not in requested_arguments:
             requested_arguments.append("id")
 
-        temp_torrents = self.client.get_torrents(arguments=requested_arguments)
+        temp_torrents = client.get_torrents(arguments=requested_arguments)
         torrent_ids = [
             int(require_adapter_field(torrent, "id", context="Transmission lazy torrent"))
             for torrent in temp_torrents
         ]
         resolver = TrLazyFieldResolver(
-            client=self.client,
+            client=client,
             torrent_ids=torrent_ids,
             strict_mode=strict_mode,
             batch_size=batch_size,
@@ -623,40 +667,44 @@ class TransmissionClient(BaseClient):
     def move_torrent(
         self, torrent: TorrentInfo, download_dir: str, move_files: bool = True
     ) -> bool:
+        client = self._ensure_client()
         try:
-            self.client.move_torrent_data(
-                torrent.id, location=download_dir, move=move_files, timeout=20
+            client.move_torrent_data(torrent.id, location=download_dir, move=move_files, timeout=20)
+            current_torrent = client.get_torrent(
+                torrent.id,
+                arguments=["id", "name", "downloadDir"],
             )
-            # 获取当前种子信息
-            torrent = self.client.get_torrent(torrent.id)
-            # strip download_dir，忽略尾部的斜杠
-            # 判断是否移动成功
-            if torrent.download_dir == download_dir.rstrip("/").rstrip("\\"):
-                logger.info("Move torrent %s to %s successfully.", torrent.name, download_dir)
+            current_dir = optional_adapter_field(current_torrent, "downloadDir", "")
+            if current_dir == download_dir.rstrip("/").rstrip("\\"):
+                logger.info("move torrent %s to %s successfully", torrent.name, download_dir)
                 return True
 
             logger.error(
-                "Move torrent %s to %s failed. Now the download dir is %s",
+                "move torrent %s to %s failed. current dir is %s",
                 torrent.name,
                 download_dir,
-                torrent.download_dir,
+                current_dir,
             )
             return False
-
-        except error.TransmissionError as e:
-            logger.error("Move torrent failed: %s", e)
+        except (
+            TransportAuthenticationError,
+            TransportConnectionError,
+            TransportProtocolError,
+        ) as exc:
+            logger.error("move torrent failed: %s", exc)
             return False
 
     def get_torrent_info(self, torrent_id: int | str) -> Optional[TorrentInfo]:
-        torrent = self.client.get_torrent(torrent_id)
+        torrent = self._ensure_client().get_torrent(torrent_id, arguments=list(_DETAIL_FIELDS))
         if torrent is None:
             return None
         return TrTorrentList(raw=[torrent]).details[0]
 
     def set_labels(self, torrent: TorrentInfo, labels: list[str]) -> None:
-        self.client.change_torrent(torrent.id, labels=labels)
+        self._ensure_client().change_torrent(torrent.id, labels=labels)
 
     def set_labels_many(self, updates: Sequence[tuple[TorrentInfo, list[str]]]) -> None:
+        client = self._ensure_client()
         buckets: dict[tuple[str, ...], list[int | str]] = {}
 
         for torrent, labels in updates:
@@ -667,37 +715,21 @@ class TransmissionClient(BaseClient):
             buckets.setdefault(target_labels, []).append(torrent.id)
 
         for target_labels, torrent_ids in buckets.items():
-            self.client.change_torrent(torrent_ids, labels=list(target_labels))
+            client.change_torrent(torrent_ids, labels=list(target_labels))
 
     def hydrate_files(self, torrent_ids: TorrentIdInput) -> TorrentList:
-        return self.get_torrents(
-            query=TorrentQuery(
-                torrent_ids=self._normalize_torrent_ids(torrent_ids),
-                fields=[
-                    "id",
-                    "hashString",
-                    "name",
-                    "downloadDir",
-                    "percentDone",
-                    "totalSize",
-                    "sizeWhenDone",
-                    "haveValid",
-                    "labels",
-                    "status",
-                    "addedDate",
-                    "files",
-                    "fileStats",
-                ],
-            )
+        torrents = self._ensure_client().get_torrents(
+            ids=self._normalize_torrent_ids(torrent_ids),
+            arguments=list(_HYDRATE_FILE_FIELDS),
         )
+        return TrTorrentList(raw=torrents)
 
     def hydrate_trackers(self, torrent_ids: TorrentIdInput) -> TorrentList:
-        return self.get_torrents(
-            query=TorrentQuery(
-                torrent_ids=self._normalize_torrent_ids(torrent_ids),
-                fields=["id", "hashString", "name", "downloadDir", "trackerStats"],
-            )
+        torrents = self._ensure_client().get_torrents(
+            ids=self._normalize_torrent_ids(torrent_ids),
+            arguments=list(_HYDRATE_TRACKER_FIELDS),
         )
+        return TrTorrentList(raw=torrents)
 
     def set_category(self, torrent_id: int | str, category: str) -> None:
         torrent = self.get_torrent_info(torrent_id)
@@ -706,21 +738,21 @@ class TransmissionClient(BaseClient):
         self.set_labels(torrent, [category])
 
     def recheck_torrent(self, torrent_id: TorrentIdInput) -> None:
-        self.client.verify_torrent(self._normalize_torrent_ids(torrent_id))
+        self._ensure_client().verify_torrent(self._normalize_torrent_ids(torrent_id))
 
     def get_peer_info(self, torrent_id: int | str) -> TorrentPeerList:
-        torrent = self.client.get_torrent(torrent_id, arguments=["id", "peers"])
-        peers = torrent.get("peers", [])
+        torrent = self._ensure_client().get_torrent(torrent_id, arguments=["id", "peers"])
+        peers = list(optional_adapter_field(torrent, "peers", []) or [])
         return TrTorrentPeerList(raw=peers)
 
     def resume_torrent(self, torrent_id: TorrentIdInput) -> None:
-        self.client.start_torrent(self._normalize_torrent_ids(torrent_id))
+        self._ensure_client().start_torrent(self._normalize_torrent_ids(torrent_id))
 
     def pause_torrent(self, torrent_id: TorrentIdInput) -> None:
-        self.client.stop_torrent(self._normalize_torrent_ids(torrent_id))
+        self._ensure_client().stop_torrent(self._normalize_torrent_ids(torrent_id))
 
     def reannounce_torrent(self, torrent_id: TorrentIdInput) -> None:
-        self.client.reannounce_torrent(self._normalize_torrent_ids(torrent_id))
+        self._ensure_client().reannounce_torrent(self._normalize_torrent_ids(torrent_id))
 
     def set_torrent_limits(
         self,
@@ -736,14 +768,15 @@ class TransmissionClient(BaseClient):
             kwargs["upload_limit"] = max(upload_limit, 0)
             kwargs["upload_limited"] = upload_limit >= 0
         if kwargs:
-            self.client.change_torrent(self._normalize_torrent_ids(torrent_id), **kwargs)
+            self._ensure_client().change_torrent(self._normalize_torrent_ids(torrent_id), **kwargs)
 
     def move_queue(self, torrent_id: TorrentIdInput, direction: QueueDirection) -> None:
+        client = self._ensure_client()
         queue_actions = {
-            QueueDirection.TOP: self.client.queue_top,
-            QueueDirection.BOTTOM: self.client.queue_bottom,
-            QueueDirection.UP: self.client.queue_up,
-            QueueDirection.DOWN: self.client.queue_down,
+            QueueDirection.TOP: client.queue_top,
+            QueueDirection.BOTTOM: client.queue_bottom,
+            QueueDirection.UP: client.queue_up,
+            QueueDirection.DOWN: client.queue_down,
         }
         queue_actions[direction](self._normalize_torrent_ids(torrent_id))
 
@@ -776,28 +809,30 @@ class TransmissionClient(BaseClient):
         if not kwargs:
             raise ValueError("set_files requires wanted or priority")
 
-        self.client.change_torrent(torrent_id, **kwargs)
+        self._ensure_client().change_torrent(torrent_id, **kwargs)
 
     def list_trackers(self, torrent_id: TorrentId) -> TorrentTrackerList:
-        torrent = self.client.get_torrent(torrent_id, arguments=["id", "trackerStats"])
-        tracker_stats = torrent.get("trackerStats", getattr(torrent, "tracker_stats", []))
+        torrent = self._ensure_client().get_torrent(torrent_id, arguments=["id", "trackerStats"])
+        tracker_stats = list(optional_adapter_field(torrent, "trackerStats", []) or [])
         return TrTorrentTrackerList(raw=tracker_stats)
 
     def add_trackers(self, torrent_id: TorrentId, tracker_urls: Sequence[str]) -> None:
         if not tracker_urls:
             return
-        self.client.change_torrent(torrent_id, tracker_add=list(tracker_urls))
+        self._ensure_client().change_torrent(torrent_id, tracker_add=list(tracker_urls))
 
     def remove_trackers(self, torrent_id: TorrentId, tracker_urls: Sequence[str]) -> None:
         tracker_ids = self._tracker_ids_from_urls(torrent_id, tracker_urls)
         if tracker_ids:
-            self.client.change_torrent(torrent_id, tracker_remove=tracker_ids)
+            self._ensure_client().change_torrent(torrent_id, tracker_remove=tracker_ids)
 
     def replace_tracker(self, torrent_id: TorrentId, old_url: str, new_url: str) -> None:
         tracker_ids = self._tracker_ids_from_urls(torrent_id, [old_url])
         if not tracker_ids:
             raise ValueError(f"tracker not found: {old_url}")
-        self.client.change_torrent(torrent_id, tracker_replace=[(tracker_ids[0], new_url)])
+        self._ensure_client().change_torrent(
+            torrent_id, tracker_replace=[(tracker_ids[0], new_url)]
+        )
 
     def rename_torrent(
         self,
@@ -807,7 +842,7 @@ class TransmissionClient(BaseClient):
         new_path: str | None = None,
     ) -> None:
         if old_path is not None and new_path is not None:
-            self.client.rename_torrent_path(torrent_id, old_path, new_path)
+            self._ensure_client().rename_torrent_path(torrent_id, old_path, new_path)
             return
 
         if new_name is not None:
@@ -830,11 +865,12 @@ class TransmissionClient(BaseClient):
             kwargs["speed_limit_up"] = max(upload_limit, 0)
             kwargs["speed_limit_up_enabled"] = upload_limit >= 0
         if kwargs:
-            self.client.set_session(**kwargs)
+            self._ensure_client().set_session(**kwargs)
 
     def get_client_stats(self) -> ClientStats:
-        session = self.client.get_session()
-        stats = self.client.session_stats()
+        client = self._ensure_client()
+        session = client.get_session()
+        stats = client.session_stats()
         return ClientStats(
             download_speed=best_effort_adapter_field(
                 stats,
@@ -885,8 +921,8 @@ class TransmissionClient(BaseClient):
     ) -> list[int]:
         if not tracker_urls:
             return []
-        torrent = self.client.get_torrent(torrent_id, arguments=["id", "trackerStats"])
-        tracker_stats = torrent.get("trackerStats", getattr(torrent, "tracker_stats", []))
+        torrent = self._ensure_client().get_torrent(torrent_id, arguments=["id", "trackerStats"])
+        tracker_stats = list(optional_adapter_field(torrent, "trackerStats", []) or [])
         tracker_id_by_url = {
             tracker.get("announce", ""): int(tracker["id"])
             for tracker in tracker_stats

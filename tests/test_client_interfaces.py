@@ -177,7 +177,13 @@ class _TransmissionRPCStub:
 
 
 class _FakeQbTorrent(dict):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        torrent_hash: str = "abc123",
+        name: str = "demo",
+        state: str = "downloading",
+    ) -> None:
         super().__init__(
             save_path="/tmp",
             total_size=10,
@@ -192,10 +198,10 @@ class _FakeQbTorrent(dict):
             num_seeds=0,
             added_on=0,
             tags="",
-            state="downloading",
+            state=state,
         )
-        self.hash = "abc123"
-        self.name = "demo"
+        self.hash = torrent_hash
+        self.name = name
 
     @property
     def files(self):  # type: ignore[no-untyped-def]
@@ -225,6 +231,8 @@ class _FakeQbTorrent(dict):
 
 class _QbRPCStub:
     def __init__(self) -> None:
+        self.response = [_FakeQbTorrent()]
+        self.add_calls = []
         self.deleted_calls = []
         self.recheck_calls = []
         self.pause_calls = []
@@ -244,13 +252,22 @@ class _QbRPCStub:
         self.rename_file_calls = []
         self.transfer_upload_limit_calls = []
         self.transfer_download_limit_calls = []
+        self.files_calls = []
+        self.properties_calls = []
+        self.files_by_hash = {}
+        self.properties_by_hash = {}
+        self.trackers_by_hash = {}
 
     def auth_log_in(self) -> bool:
         return True
 
     def torrents_info(self, **kwargs):  # type: ignore[no-untyped-def]
         self.last_info_kwargs = kwargs
-        return [_FakeQbTorrent()]
+        return self.response
+
+    def torrents_add(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.add_calls.append(kwargs)
+        return {"ok": True, "result": "Ok."}
 
     def torrents_delete(self, torrent_hashes=None, delete_files=False):  # type: ignore[no-untyped-def]
         self.deleted_calls.append((torrent_hashes, delete_files))
@@ -294,8 +311,9 @@ class _QbRPCStub:
     def torrents_file_priority(self, torrent_hash=None, file_ids=None, priority=None):  # type: ignore[no-untyped-def]
         self.file_priority_calls.append((torrent_hash, file_ids, priority))
 
-    def torrents_trackers(self, torrent_hash=None):  # type: ignore[no-untyped-def]
-        _ = torrent_hash
+    def torrents_trackers(self, *, torrent_hash=None):  # type: ignore[no-untyped-def]
+        if torrent_hash in self.trackers_by_hash:
+            return self.trackers_by_hash[torrent_hash]
         return [
             {
                 "url": "http://old.tracker/a",
@@ -306,6 +324,14 @@ class _QbRPCStub:
                 "msg": "",
             }
         ]
+
+    def torrents_files(self, *, torrent_hash=None):  # type: ignore[no-untyped-def]
+        self.files_calls.append(torrent_hash)
+        return self.files_by_hash.get(torrent_hash, [])
+
+    def torrents_properties(self, *, torrent_hash=None):  # type: ignore[no-untyped-def]
+        self.properties_calls.append(torrent_hash)
+        return self.properties_by_hash.get(torrent_hash, {"comment": ""})
 
     def torrents_add_trackers(self, torrent_hash=None, urls=None):  # type: ignore[no-untyped-def]
         self.add_trackers_calls.append((torrent_hash, urls))
@@ -375,7 +401,7 @@ class _QbMoveReStopRPCStub(_QbMoveRPCStub):
 
 def _new_qb_client() -> QbittorrentClient:
     return QbittorrentClient(
-        os.getenv("TEST_QB_URL", "http://127.0.0.1:8080/"),
+        os.getenv("TEST_QB_URL", "http://localhost:8080/"),
         os.getenv("TEST_QB_USERNAME", ""),
         os.getenv("TEST_QB_PASSWORD", ""),
         name="qb",
@@ -384,7 +410,7 @@ def _new_qb_client() -> QbittorrentClient:
 
 def _new_tr_client() -> TransmissionClient:
     return TransmissionClient(
-        os.getenv("TEST_TR_URL", "http://127.0.0.1:9091/"),
+        os.getenv("TEST_TR_URL", "http://localhost:9091/"),
         os.getenv("TEST_TR_USERNAME", ""),
         os.getenv("TEST_TR_PASSWORD", ""),
         name="tr",
@@ -416,6 +442,50 @@ def test_transmission_add_torrent_supports_local_file_input(tmp_path: Path) -> N
     assert ok is True
     assert isinstance(stub.added_payload, bytes)
     assert len(stub.added_payload) > 0
+
+
+def test_qb_add_torrent_supports_magnet_input() -> None:
+    client = _new_qb_client()
+    stub = _QbRPCStub()
+    client.client = stub
+
+    ok = client.add_torrent(
+        "magnet:?xt=urn:btih:abcdef",
+        upload_limit=100,
+        download_limit=200,
+        download_dir="/downloads",
+        is_paused=True,
+    )
+
+    assert ok is True
+    assert stub.add_calls == [
+        {
+            "urls": "magnet:?xt=urn:btih:abcdef",
+            "save_path": "/downloads",
+            "is_paused": True,
+            "download_limited": True,
+            "upload_limited": True,
+            "upload_limit": 100,
+            "download_limit": 200,
+            "skip_checking": False,
+            "category": "",
+            "forced": False,
+        }
+    ]
+
+
+def test_qb_add_torrent_supports_local_file_input(tmp_path: Path) -> None:
+    torrent_file = tmp_path / "demo.torrent"
+    torrent_file.write_bytes(b"d8:announce0:e")
+
+    client = _new_qb_client()
+    stub = _QbRPCStub()
+    client.client = stub
+
+    ok = client.add_torrent(str(torrent_file))
+
+    assert ok is True
+    assert stub.add_calls[-1]["torrent_files"] == {"demo.torrent": b"d8:announce0:e"}
 
 
 def test_transmission_get_peer_info_returns_mapped_peer_list() -> None:
@@ -452,8 +522,11 @@ def test_qb_supports_ip_ban_capability() -> None:
 def test_transmission_supports_lazy_fetch_capability() -> None:
     client = _new_tr_client()
 
-    assert client.supports_capability(SupportsLazyTorrentFetch)
-    assert client.require_capability(SupportsLazyTorrentFetch) is client
+    with pytest.warns(DeprecationWarning, match="SupportsLazyTorrentFetch"):
+        assert client.supports_capability(SupportsLazyTorrentFetch)
+
+    with pytest.warns(DeprecationWarning, match="SupportsLazyTorrentFetch"):
+        assert client.require_capability(SupportsLazyTorrentFetch) is client
 
 
 def test_transmission_require_ip_ban_capability_raises() -> None:
@@ -486,19 +559,18 @@ def test_transmission_remove_torrent_supports_batch_and_delete_data_flag() -> No
 
 def test_qb_hydrate_files_uses_torrent_id_query() -> None:
     client = _new_qb_client()
-    captured_queries = []
-
-    def _fake_get_torrents(status=None, query=None):  # type: ignore[no-untyped-def]
-        captured_queries.append((status, query))
-        return ["hydrated"]
-
-    client.get_torrents = _fake_get_torrents  # type: ignore[method-assign]
+    stub = _QbRPCStub()
+    stub.files_by_hash = {
+        "hash-a": [{"name": "a.bin", "size": 10, "progress": 1.0, "priority": 1}],
+        "hash-b": [{"name": "b.bin", "size": 20, "progress": 1.0, "priority": 0}],
+    }
+    client.client = stub
 
     result = client.hydrate_files(["hash-a", "hash-b"])
 
-    assert result == ["hydrated"]
-    assert captured_queries[0][0] is None
-    assert captured_queries[0][1].torrent_ids == ["hash-a", "hash-b"]
+    assert len(result) == 1
+    assert stub.last_info_kwargs["torrent_hashes"] == ["hash-a", "hash-b"]
+    assert stub.files_calls == ["abc123"]
 
 
 def test_transmission_hydrate_files_requests_file_arguments() -> None:
@@ -523,6 +595,11 @@ def test_transmission_hydrate_files_requests_file_arguments() -> None:
                 "labels",
                 "status",
                 "addedDate",
+                "rateDownload",
+                "rateUpload",
+                "uploadedEver",
+                "peersSendingToUs",
+                "peersGettingFromUs",
                 "files",
                 "fileStats",
             ),
@@ -574,10 +651,10 @@ def test_qb_get_torrents_supports_query_object_filters() -> None:
         offset=3,
         torrent_ids=["hash-a", "hash-b"],
     )
-    _ = client.get_torrents(status="downloading", query=query)
+    _ = client.get_torrents(query=query)
 
     assert stub.last_info_kwargs == {
-        "status_filter": "downloading",
+        "status_filter": None,
         "category": "cat-a",
         "tag": "tag-a",
         "sort": "name",
@@ -586,6 +663,32 @@ def test_qb_get_torrents_supports_query_object_filters() -> None:
         "offset": 3,
         "torrent_hashes": ["hash-a", "hash-b"],
     }
+
+
+def test_qb_get_torrents_warns_for_deprecated_query_fields() -> None:
+    client = _new_qb_client()
+    stub = _QbRPCStub()
+    client.client = stub
+
+    with pytest.warns(DeprecationWarning, match="TorrentQuery.fields"):
+        _ = client.get_torrents(query=TorrentQuery(fields=["hash", "name"]))
+
+    assert stub.last_info_kwargs == {"status_filter": None}
+
+
+def test_qb_get_torrents_filters_by_domain_status_without_vendor_prefilter() -> None:
+    client = _new_qb_client()
+    stub = _QbRPCStub()
+    stub.response = [
+        _FakeQbTorrent(torrent_hash="hash-a", state="downloading"),
+        _FakeQbTorrent(torrent_hash="hash-b", state="pausedDL"),
+    ]
+    client.client = stub
+
+    torrents = client.get_torrents(status="stopped")
+
+    assert [torrent.hash_string for torrent in torrents] == ["hash-b"]
+    assert stub.last_info_kwargs == {"status_filter": None}
 
 
 def test_transmission_get_torrents_supports_query_object_fields() -> None:
@@ -597,9 +700,32 @@ def test_transmission_get_torrents_supports_query_object_fields() -> None:
         torrent_ids=[101, 202],
         fields=["id", "name", "status"],
     )
-    _ = client.get_torrents(query=query)
+    with pytest.warns(DeprecationWarning, match="TorrentQuery.fields"):
+        _ = client.get_torrents(query=query)
 
-    assert stub.get_torrents_calls == [{"ids": (101, 202), "arguments": ("id", "name", "status")}]
+    assert stub.get_torrents_calls == [
+        {
+            "ids": (101, 202),
+            "arguments": (
+                "id",
+                "hashString",
+                "name",
+                "downloadDir",
+                "percentDone",
+                "totalSize",
+                "sizeWhenDone",
+                "haveValid",
+                "labels",
+                "status",
+                "addedDate",
+                "rateDownload",
+                "rateUpload",
+                "uploadedEver",
+                "peersSendingToUs",
+                "peersGettingFromUs",
+            ),
+        }
+    ]
 
 
 def test_qb_move_torrent_returns_true_when_location_matches() -> None:

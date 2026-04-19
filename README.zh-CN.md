@@ -14,8 +14,8 @@ pip install -e .
 
 ## 支持的下载器版本
 
-- qBittorrent：当前项目固定依赖 `qbittorrent-api>=2024.10.68,<2024.11`。上游 `qbittorrent-api` `v2024.10.68` 本身是面向 qBittorrent `v4.1+` 的 Web API 客户端，并明确声明支持 qBittorrent `v5.0.1`（Web API `v2.11.2`）。结合本仓库现有兼容处理，当前可文档化的目标范围可保守理解为 qBittorrent `4.x` 到 `5.0.1`；其中 qB 5 的 `start/stop` 与旧版 `resume/pause` 命名差异已在适配层兼容。qBittorrent `5.1+` 可能可用，但当前这条依赖线下还没有被文档化为正式支持范围。
-- Transmission：当前项目固定依赖 `transmission-rpc>=7.0.11,<8`。上游 `transmission-rpc` `v7.0.11` 文档声明支持 Transmission `2.40` 到 `4.0.6`。更新的 Transmission 版本可能仍可工作，但若出现新的 RPC 字段或特性，可能需要先升级依赖后才能完整支持。
+- qBittorrent：仓库自有 transport 当前文档化支持 qBittorrent `4.x` 到 `5.0.1`，并兼容 qB 5 的 `start/stop` 与旧版 `resume/pause` 控制命名差异。
+- Transmission：仓库自有 transport 当前文档化支持 Transmission `2.40` 到 `4.0.6`。
 
 ## 快速开始
 
@@ -35,8 +35,8 @@ qb_client.login()
 
 tr_client = get_downloader_client(
     url="http://localhost:9091/",
-    username="<你的 Transmission 用户名>",
-    password="<你的 Transmission 密码>",
+    username="<your-transmission-username>",
+    password="<your-transmission-password>",
     dl_type=ClientType.TRANSMISSION,
     name="tr",
 )
@@ -45,8 +45,10 @@ tr_client.login()
 qb_client.reannounce_torrent("torrent-hash")
 tr_client.move_queue([1, 2], QueueDirection.TOP)
 
-query = TorrentQuery(fields=["id", "name", "status"])
-tr_torrents = tr_client.get_torrents(query=query)
+snapshots = qb_client.get_torrents_snapshot()
+summary = tr_client.get_torrents(query=TorrentQuery(torrent_ids=[1, 2]))
+detail = tr_client.get_torrent_info(1)
+hydrated = tr_client.hydrate_files([1, 2])
 ```
 
 ## 通用接口
@@ -55,11 +57,13 @@ qB 和 TR 都支持以下接口：
 
 - `add_torrent(...)`
 - `remove_torrent(torrent_id_or_ids, delete_data=False)`
+- `get_torrents_snapshot(status=None, query=None)`
 - `get_torrents(status=None, query=None)`
 - `get_torrent_info(torrent_id)`
+- `hydrate_files(torrent_id_or_ids)`
+- `hydrate_trackers(torrent_id_or_ids)`
 - `move_torrent(torrent, download_dir, move_files=True) -> bool`
 - `set_labels(...)`
-- `set_category(...)`
 - `resume_torrent(torrent_id_or_ids)`
 - `pause_torrent(torrent_id_or_ids)`
 - `recheck_torrent(torrent_id_or_ids)`
@@ -87,23 +91,26 @@ qB 和 TR 都支持以下接口：
 from torrent_clients.client.base_client import TorrentQuery
 
 query = TorrentQuery(
-    category="movies",      # qB
-    tag="private",          # qB
-    sort="name",            # qB
-    reverse=True,           # qB
-    limit=50,               # qB
-    offset=0,               # qB
-    torrent_ids=[1, 2, 3],  # qB + TR
-    fields=["id", "name"],  # TR
+    torrent_ids=[1, 2, 3],  # 共享契约
 )
 
-torrents = tr_client.get_torrents(query=query)
+torrents = qb_client.get_torrents(query=query)
 ```
+
+下载器特有筛选项仍只保留为过渡期兼容行为，不属于文档化的通用契约。
+
+`TorrentQuery.fields` 只保留一个过渡版本的兼容用途。新代码应改用：
+
+- `get_torrents()` 获取 summary 列表
+- `get_torrent_info()` 获取单个种子的 eager detail
+- `hydrate_files()` / `hydrate_trackers()` 显式拉取重字段
 
 ## 说明
 
 - `rename_torrent(..., new_name=...)` 仅 qB 支持。
 - Transmission 的重命名能力使用 `old_path + new_path`（底层 `rename_torrent_path`）。
+- `get_torrents()` 和 `get_torrents_snapshot()` 不会再进行隐藏的远程 lazy 加载。`files`、`trackers`、`comment` 等重字段只会由 `get_torrent_info()` 或 `hydrate_*()` 填充。
+- `get_torrents_original()`、`get_torrents_lazy()`、`SupportsLazyTorrentFetch`、`TorrentQuery.fields` 都属于过渡兼容层，调用时会立即发出 `DeprecationWarning`。
 
 ## 推荐集成模式（适用于 `torrent-transfer`）
 
@@ -136,27 +143,28 @@ snapshot_id_to_client = result.snapshot_id_to_client
 ## 下载器特有能力（Capability）
 
 ```python
-from torrent_clients.client.base_client import SupportsIpBan, SupportsLazyTorrentFetch
+from torrent_clients.client.base_client import SupportsCategoryManagement, SupportsIpBan
 
 if qb_client.supports_capability(SupportsIpBan):
     qb_client.require_capability(SupportsIpBan).ban_ips(["1.2.3.4"])
 
-if tr_client.supports_capability(SupportsLazyTorrentFetch):
-    lazy_torrents = tr_client.require_capability(
-        SupportsLazyTorrentFetch
-    ).get_torrents_lazy()
+if qb_client.supports_capability(SupportsCategoryManagement):
+    qb_client.require_capability(SupportsCategoryManagement).set_category(
+        "torrent-hash",
+        "movies",
+    )
 ```
 
 如果客户端不支持该能力，`require_capability(...)` 会抛出 `UnsupportedClientCapabilityError`。
 
-## Transmission 的 Lazy / Strict 行为
+## 已弃用的兼容 API
 
-`TransmissionClient.get_torrents_lazy(...)` 有两种模式：
+以下 API 只在过渡版本中保留，并且一旦调用就会发出 `DeprecationWarning`：
 
-- `arguments=None`：默认 hybrid 模式。标量字段会预取，重字段走 lazy/hybrid。
-- `arguments=[...]`：严格模式。只请求你指定的字段，禁用自动 lazy/hybrid 补拉。
-
-严格模式下，访问未请求字段会抛出 `MissingTorrentFieldError`。
+- `TransmissionClient.get_torrents_lazy(...)`
+- `SupportsLazyTorrentFetch`
+- `TorrentQuery.fields`
+- `QbittorrentClient.get_torrents_original(...)`
 
 ## 本地联调地址
 
@@ -167,22 +175,22 @@ if tr_client.supports_capability(SupportsLazyTorrentFetch):
 
 `tests/test_client_interfaces.py` 通过环境变量读取测试地址和凭据：
 
-- `TEST_QB_URL`（默认：`http://127.0.0.1:8080/`）
+- `TEST_QB_URL`（默认：`http://localhost:8080/`）
 - `TEST_QB_USERNAME`（默认：空字符串）
 - `TEST_QB_PASSWORD`（默认：空字符串）
-- `TEST_TR_URL`（默认：`http://127.0.0.1:9091/`）
+- `TEST_TR_URL`（默认：`http://localhost:9091/`）
 - `TEST_TR_USERNAME`（默认：空字符串）
 - `TEST_TR_PASSWORD`（默认：空字符串）
 
 示例：
 
 ```bash
-export TEST_QB_URL="http://127.0.0.1:8080/"
+export TEST_QB_URL="http://localhost:8080/"
 export TEST_QB_USERNAME=""
 export TEST_QB_PASSWORD=""
-export TEST_TR_URL="http://127.0.0.1:9091/"
-export TEST_TR_USERNAME="your_username"
-export TEST_TR_PASSWORD="your_password"
+export TEST_TR_URL="http://localhost:9091/"
+export TEST_TR_USERNAME="test_user"
+export TEST_TR_PASSWORD="test_password"
 python -m pytest tests/test_client_interfaces.py
 ```
 

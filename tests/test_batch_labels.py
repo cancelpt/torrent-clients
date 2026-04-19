@@ -33,7 +33,7 @@ class _TransmissionRPCStub:
 
 
 def test_transmission_set_labels_many_groups_updates_by_target_labels() -> None:
-    client = TransmissionClient("http://127.0.0.1:9091/", "", "", name="tr")
+    client = TransmissionClient("http://localhost:9091/", "", "", name="tr")
     stub = _TransmissionRPCStub()
     client.client = stub
     torrent_a = SimpleNamespace(id=1, labels=["old-a"])
@@ -55,7 +55,7 @@ def test_transmission_set_labels_many_groups_updates_by_target_labels() -> None:
 
 
 def test_qb_set_labels_many_groups_add_and_remove_deltas() -> None:
-    client = QbittorrentClient("http://127.0.0.1:8080/", "", "", name="qb")
+    client = QbittorrentClient("http://localhost:8080/", "", "", name="qb")
     stub = _QbRPCStub()
     client.client = stub
     torrent_a = SimpleNamespace(id="hash-a", hash_string="hash-a", labels=["A"])

@@ -16,8 +16,8 @@ pip install -e .
 
 ## Supported Downloader Versions
 
-- qBittorrent: this project currently pins `qbittorrent-api>=2024.10.68,<2024.11`. Upstream `qbittorrent-api` v2024.10.68 is a qBittorrent Web API client for qBittorrent `v4.1+` and explicitly advertises support for qBittorrent `v5.0.1` (Web API `v2.11.2`). In practice, this repository currently targets qBittorrent `4.x` through `5.0.1`, and includes compatibility for the qB 5 `start/stop` vs legacy `resume/pause` naming change. qBittorrent `5.1+` may work, but is not currently documented as supported by this pinned dependency line.
-- Transmission: this project currently pins `transmission-rpc>=7.0.11,<8`. Upstream `transmission-rpc` v7.0.11 documents support for Transmission `2.40` through `4.0.6`. Newer Transmission releases may still work, but newer RPC fields or features may be missing until the dependency is updated.
+- qBittorrent: the repository-owned transport currently targets qBittorrent `4.x` through `5.0.1`, including the qB 5 `start/stop` vs legacy `resume/pause` control compatibility.
+- Transmission: the repository-owned transport currently targets Transmission `2.40` through `4.0.6`.
 
 ## Quick Start
 
@@ -48,8 +48,10 @@ tr_client.login()
 qb_client.reannounce_torrent("torrent-hash")
 tr_client.move_queue([1, 2], QueueDirection.TOP)
 
-query = TorrentQuery(fields=["id", "name", "status"])
-tr_torrents = tr_client.get_torrents(query=query)
+snapshots = qb_client.get_torrents_snapshot()
+summary = tr_client.get_torrents(query=TorrentQuery(torrent_ids=[1, 2]))
+detail = tr_client.get_torrent_info(1)
+hydrated = tr_client.hydrate_files([1, 2])
 ```
 
 ## Common API
@@ -58,11 +60,13 @@ Both clients implement these core methods:
 
 - `add_torrent(...)`
 - `remove_torrent(torrent_id_or_ids, delete_data=False)`
+- `get_torrents_snapshot(status=None, query=None)`
 - `get_torrents(status=None, query=None)`
 - `get_torrent_info(torrent_id)`
+- `hydrate_files(torrent_id_or_ids)`
+- `hydrate_trackers(torrent_id_or_ids)`
 - `move_torrent(torrent, download_dir, move_files=True) -> bool`
 - `set_labels(...)`
-- `set_category(...)`
 - `resume_torrent(torrent_id_or_ids)`
 - `pause_torrent(torrent_id_or_ids)`
 - `recheck_torrent(torrent_id_or_ids)`
@@ -92,18 +96,19 @@ Use `TorrentQuery` for unified list retrieval options:
 from torrent_clients.client.base_client import TorrentQuery
 
 query = TorrentQuery(
-    category="movies",      # qB
-    tag="private",          # qB
-    sort="name",            # qB
-    reverse=True,           # qB
-    limit=50,               # qB
-    offset=0,               # qB
-    torrent_ids=[1, 2, 3],  # qB + TR
-    fields=["id", "name"],  # TR
+    torrent_ids=[1, 2, 3],  # shared contract
 )
 
-torrents = tr_client.get_torrents(status=None, query=query)
+torrents = qb_client.get_torrents(status=None, query=query)
 ```
+
+Downloader-specific selectors remain transition-only compatibility behavior and are intentionally not part of the documented common contract.
+
+`TorrentQuery.fields` remains a deprecated compatibility shim for one transition release. New code should use:
+
+- `get_torrents()` for summary lists
+- `get_torrent_info()` for eager single-torrent detail
+- `hydrate_files()` / `hydrate_trackers()` for explicit heavy-field retrieval
 
 ### Recommended Integration Pattern (for `torrent-transfer`)
 
@@ -137,33 +142,36 @@ snapshot_id_to_client = result.snapshot_id_to_client
 
 - `rename_torrent(..., new_name=...)` is qBittorrent-only.
 - Transmission supports rename via `old_path + new_path` (RPC `rename_torrent_path`).
+- `get_torrents()` and `get_torrents_snapshot()` do not perform hidden remote lazy-loading. Heavy fields such as `files`, `trackers`, and `comment` are populated only by `get_torrent_info()` or `hydrate_*()`.
+- `get_torrents_original()`, `get_torrents_lazy()`, `SupportsLazyTorrentFetch`, and `TorrentQuery.fields` are deprecated compatibility surface and emit `DeprecationWarning` on use.
 
 ## Downloader-specific Capabilities
 
 Use capability checks for downloader-specific features:
 
 ```python
-from torrent_clients.client.base_client import SupportsIpBan, SupportsLazyTorrentFetch
+from torrent_clients.client.base_client import SupportsCategoryManagement, SupportsIpBan
 
 if qb_client.supports_capability(SupportsIpBan):
     qb_client.require_capability(SupportsIpBan).ban_ips(["1.2.3.4"])
 
-if tr_client.supports_capability(SupportsLazyTorrentFetch):
-    lazy_torrents = tr_client.require_capability(
-        SupportsLazyTorrentFetch
-    ).get_torrents_lazy()
+if qb_client.supports_capability(SupportsCategoryManagement):
+    qb_client.require_capability(SupportsCategoryManagement).set_category(
+        "torrent-hash",
+        "movies",
+    )
 ```
 
 `require_capability(...)` raises `UnsupportedClientCapabilityError` when unsupported.
 
-## Transmission Lazy/Strict Behavior
+## Deprecated Compatibility APIs
 
-`TransmissionClient.get_torrents_lazy(...)` has two modes:
+The following APIs remain available only during the transition release and emit `DeprecationWarning` immediately on use:
 
-- `arguments=None`: default hybrid mode. Scalar fields are prefetched, heavy fields are lazy/hybrid fetched.
-- `arguments=[...]`: strict mode. Only user-defined fields are fetched, and auto lazy/hybrid fetch is disabled.
-
-In strict mode, accessing a non-requested field raises `MissingTorrentFieldError`.
+- `TransmissionClient.get_torrents_lazy(...)`
+- `SupportsLazyTorrentFetch`
+- `TorrentQuery.fields`
+- `QbittorrentClient.get_torrents_original(...)`
 
 ## Local Integration Endpoints
 
@@ -174,22 +182,22 @@ In strict mode, accessing a non-requested field raises `MissingTorrentFieldError
 
 `tests/test_client_interfaces.py` loads endpoints and credentials from environment variables:
 
-- `TEST_QB_URL` (default: `http://127.0.0.1:8080/`)
+- `TEST_QB_URL` (default: `http://localhost:8080/`)
 - `TEST_QB_USERNAME` (default: empty)
 - `TEST_QB_PASSWORD` (default: empty)
-- `TEST_TR_URL` (default: `http://127.0.0.1:9091/`)
+- `TEST_TR_URL` (default: `http://localhost:9091/`)
 - `TEST_TR_USERNAME` (default: empty)
 - `TEST_TR_PASSWORD` (default: empty)
 
 Example:
 
 ```bash
-export TEST_QB_URL="http://127.0.0.1:8080/"
+export TEST_QB_URL="http://localhost:8080/"
 export TEST_QB_USERNAME=""
 export TEST_QB_PASSWORD=""
-export TEST_TR_URL="http://127.0.0.1:9091/"
-export TEST_TR_USERNAME="your_username"
-export TEST_TR_PASSWORD="your_password"
+export TEST_TR_URL="http://localhost:9091/"
+export TEST_TR_USERNAME="test_user"
+export TEST_TR_PASSWORD="test_password"
 python -m pytest tests/test_client_interfaces.py
 ```
 
