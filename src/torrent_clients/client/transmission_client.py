@@ -685,6 +685,7 @@ class TransmissionClient(BaseClient):
                     "labels",
                     "status",
                     "addedDate",
+                    "comment",
                     "files",
                     "fileStats",
                 ],
@@ -695,7 +696,16 @@ class TransmissionClient(BaseClient):
         return self.get_torrents(
             query=TorrentQuery(
                 torrent_ids=self._normalize_torrent_ids(torrent_ids),
-                fields=["id", "hashString", "name", "downloadDir", "trackerStats"],
+                fields=[
+                    "id",
+                    "hashString",
+                    "name",
+                    "downloadDir",
+                    "labels",
+                    "status",
+                    "comment",
+                    "trackerStats",
+                ],
             )
         )
 

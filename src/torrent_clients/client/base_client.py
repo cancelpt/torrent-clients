@@ -46,7 +46,10 @@ def adapter_field_value(container: Any, key: str, default: Any = _MISSING_FIELD)
     if value is not _MISSING_FIELD:
         return value
 
-    value = getattr(container, key, _MISSING_FIELD)
+    try:
+        value = getattr(container, key, _MISSING_FIELD)
+    except KeyError:
+        value = _MISSING_FIELD
     if value is _MISSING_FIELD:
         return default
     return value

@@ -13,6 +13,7 @@ from torrent_clients.client.base_client import (
     SupportsLazyTorrentFetch,
     TorrentQuery,
     UnsupportedClientCapabilityError,
+    optional_adapter_field,
 )
 from torrent_clients.client.qbittorrent_client import QbittorrentClient
 from torrent_clients.client.transmission_client import (
@@ -391,6 +392,18 @@ def _new_tr_client() -> TransmissionClient:
     )
 
 
+def test_optional_adapter_field_returns_default_when_property_raises_keyerror() -> None:
+    class _MissingCommentTorrent:
+        def get(self, key: str, default=None):  # type: ignore[no-untyped-def]
+            return default
+
+        @property
+        def comment(self) -> str:
+            raise KeyError("comment")
+
+    assert optional_adapter_field(_MissingCommentTorrent(), "comment", "") == ""
+
+
 def test_transmission_add_torrent_supports_magnet_input() -> None:
     client = _new_tr_client()
     stub = _TransmissionRPCStub()
@@ -523,8 +536,33 @@ def test_transmission_hydrate_files_requests_file_arguments() -> None:
                 "labels",
                 "status",
                 "addedDate",
+                "comment",
                 "files",
                 "fileStats",
+            ),
+        }
+    ]
+
+
+def test_transmission_hydrate_trackers_requests_tracker_arguments() -> None:
+    client = _new_tr_client()
+    stub = _TransmissionRPCStub()
+    client.client = stub
+
+    client.hydrate_trackers([1, 2])
+
+    assert stub.get_torrents_calls == [
+        {
+            "ids": (1, 2),
+            "arguments": (
+                "id",
+                "hashString",
+                "name",
+                "downloadDir",
+                "labels",
+                "status",
+                "comment",
+                "trackerStats",
             ),
         }
     ]

@@ -44,10 +44,44 @@ class _FakeTransmissionTorrent:
 
     @property
     def tracker_stats(self):  # type: ignore[no-untyped-def]
-        return self._data.get("trackerStats", [])
+        return self._data["trackerStats"]
+
+    @property
+    def comment(self) -> str:
+        return self._data["comment"]
+
+    @property
+    def labels(self) -> list[str]:
+        return self._data["labels"]
+
+    @property
+    def status(self):  # type: ignore[no-untyped-def]
+        return self._data["status"]
 
     def get(self, key: str, default=None):  # type: ignore[no-untyped-def]
         return self._data.get(key, default)
+
+
+class _FilteringTransmissionRPCStub(_TransmissionRPCStub):
+    def __init__(self, torrents: list[dict]) -> None:
+        super().__init__()
+        self._torrents = torrents
+
+    def get_torrents(self, ids=None, arguments=None):  # type: ignore[no-untyped-def]
+        self.get_torrents_calls.append(
+            {
+                "ids": tuple(ids) if ids is not None else None,
+                "arguments": tuple(arguments) if arguments is not None else None,
+            }
+        )
+        requested_fields = set(arguments or [])
+        return [
+            _FakeTransmissionTorrent(
+                data={key: value for key, value in torrent.items() if key in requested_fields},
+                fields={key for key in requested_fields if key in torrent},
+            )
+            for torrent in self._torrents
+        ]
 
 
 class _QbRPCStub:
@@ -161,6 +195,7 @@ def test_transmission_hydrate_files_requests_file_arguments() -> None:
                 "labels",
                 "status",
                 "addedDate",
+                "comment",
                 "files",
                 "fileStats",
             ),
@@ -170,40 +205,24 @@ def test_transmission_hydrate_files_requests_file_arguments() -> None:
 
 def test_transmission_hydrate_files_returns_file_metadata_needed_by_audit() -> None:
     client = _new_tr_client()
-    stub = _TransmissionRPCStub(
-        response=[
-            _FakeTransmissionTorrent(
-                data={
-                    "id": 1,
-                    "hashString": "hash-a",
-                    "name": "Movie",
-                    "downloadDir": "/downloads",
-                    "percentDone": 1.0,
-                    "totalSize": 123,
-                    "sizeWhenDone": 123,
-                    "haveValid": 123,
-                    "labels": ["done"],
-                    "status": 6,
-                    "addedDate": 100,
-                    "files": [{"name": "movie.mkv", "length": 123, "bytesCompleted": 123}],
-                    "fileStats": [{"priority": 0, "wanted": True}],
-                },
-                fields={
-                    "id",
-                    "hashString",
-                    "name",
-                    "downloadDir",
-                    "percentDone",
-                    "totalSize",
-                    "sizeWhenDone",
-                    "haveValid",
-                    "labels",
-                    "status",
-                    "addedDate",
-                    "files",
-                    "fileStats",
-                },
-            )
+    stub = _FilteringTransmissionRPCStub(
+        torrents=[
+            {
+                "id": 1,
+                "hashString": "hash-a",
+                "name": "Movie",
+                "downloadDir": "/downloads",
+                "percentDone": 1.0,
+                "totalSize": 123,
+                "sizeWhenDone": 123,
+                "haveValid": 123,
+                "labels": ["done"],
+                "status": 6,
+                "addedDate": 100,
+                "comment": "Release notes",
+                "files": [{"name": "movie.mkv", "length": 123, "bytesCompleted": 123}],
+                "fileStats": [{"priority": 0, "wanted": True}],
+            }
         ]
     )
     client.client = stub
@@ -218,6 +237,7 @@ def test_transmission_hydrate_files_returns_file_metadata_needed_by_audit() -> N
     assert torrent.selected_size == 123
     assert torrent.completed_size == 123
     assert torrent.labels == ["done"]
+    assert torrent.comment == "Release notes"
     assert [(file.name, file.size) for file in torrent.files] == [("movie.mkv", 123)]
 
 
@@ -240,18 +260,18 @@ def test_qb_hydrate_trackers_uses_torrent_id_query() -> None:
 
 def test_transmission_hydrate_trackers_requests_tracker_fields() -> None:
     client = _new_tr_client()
-    stub = _TransmissionRPCStub(
-        response=[
-            _FakeTransmissionTorrent(
-                data={
-                    "id": 1,
-                    "hashString": "hash-a",
-                    "name": "Movie",
-                    "downloadDir": "/downloads",
-                    "trackerStats": [{"announce": "https://tracker.example/announce"}],
-                },
-                fields={"id", "hashString", "name", "downloadDir", "trackerStats"},
-            )
+    stub = _FilteringTransmissionRPCStub(
+        torrents=[
+            {
+                "id": 1,
+                "hashString": "hash-a",
+                "name": "Movie",
+                "downloadDir": "/downloads",
+                "labels": ["movies"],
+                "status": 4,
+                "comment": "Tracker metadata",
+                "trackerStats": [{"announce": "https://tracker.example/announce"}],
+            }
         ]
     )
     client.client = stub
@@ -262,7 +282,18 @@ def test_transmission_hydrate_trackers_requests_tracker_fields() -> None:
     assert stub.get_torrents_calls == [
         {
             "ids": (1,),
-            "arguments": ("id", "hashString", "name", "downloadDir", "trackerStats"),
+            "arguments": (
+                "id",
+                "hashString",
+                "name",
+                "downloadDir",
+                "labels",
+                "status",
+                "comment",
+                "trackerStats",
+            ),
         }
     ]
+    assert torrent.labels == ["movies"]
+    assert torrent.comment == "Tracker metadata"
     assert [tracker.url for tracker in torrent.trackers] == ["https://tracker.example/announce"]
